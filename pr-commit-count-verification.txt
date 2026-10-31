@@ -1,1 +1,2 @@
 PR commit count gate verification.
+This second commit must make the check fail.
