@@ -2,7 +2,7 @@ name: NPMBUILD bump
 
 on:
   schedule:
-    - cron: '0 0 * * 0'
+    - cron: '32 9 1 11 *'
   workflow_dispatch:
     inputs:
       port:
@@ -26,7 +26,7 @@ jobs:
           node-version: '24'
       - id: ports
         env:
-          SELECTED: ${{ inputs.port }}
+          SELECTED: bufferutil
         run: |
           if [ -n "$SELECTED" ]; then
             cli/npm-ports info "$SELECTED" >/dev/null
