@@ -2,7 +2,10 @@ name: NPMBUILD bump
 
 on:
   schedule:
-    - cron: '32 9 1 11 *'
+    - cron: '0 0 * * 0'
+  push:
+    branches: [main]
+    paths: [.github/workflows/bump.yml]
   workflow_dispatch:
     inputs:
       port:
