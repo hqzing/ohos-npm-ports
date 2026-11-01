@@ -79,8 +79,8 @@ export function singlePortDirectory(paths) {
 
 export function assertPortPaths(paths, portDirectory) {
   for (const path of paths) {
-    if (!path.startsWith(`${portDirectory}/`)) {
-      throw new Error(`AI changed a file outside ${portDirectory}: ${path}`);
+    if (path !== `${portDirectory}/NPMBUILD` && !path.startsWith(`${portDirectory}/patches/`)) {
+      throw new Error(`AI bump only allows NPMBUILD and patches changes: ${path}`);
     }
   }
 }
@@ -169,7 +169,7 @@ function promptFor(state) {
   return `你需要修复一个 npm 包移植到 OpenHarmony 后的自动版本升级 PR。
 
 仓库位于 /workspace，PR 标题：${state.title}
-只允许修改 ${state.portDirectory}/ 内的文件。目标上游版本必须保持为 ${state.port.version}，不得通过降级、删除测试、跳过检查或屏蔽错误来制造成功。
+只允许修改 ${state.portDirectory}/NPMBUILD 和 ${state.portDirectory}/patches/ 内的文件。目标上游版本必须保持为 ${state.port.version}，不得通过降级、删除测试、跳过检查或屏蔽错误来制造成功。构建产生的其他文件不会进入修复补丁。
 
 先执行 cli/npm-ports check ${state.portDirectory} 复现失败。查看 git diff HEAD^ HEAD 了解本次升级，检查现有补丁和构建参数，必要时对照上游同版本源码与变更。保留已有的 OpenHarmony 适配，不要修改其他 port、CLI、文档或工作流，不要执行 git commit 或 git push，不要读取或输出 DEEPSEEK_API_KEY。
 
@@ -206,6 +206,20 @@ dsh --profile headless "$(cat /report/prompt.txt)"`;
   }
 }
 
+export function stageRepair(state) {
+  const tracked = output('git', ['diff', '--name-only', '-z', 'HEAD', '--']).split('\0').filter(Boolean);
+  assertPortPaths(tracked, state.portDirectory);
+  const candidates = changedPaths().filter((path) => (
+    path === `${state.portDirectory}/NPMBUILD` || path.startsWith(`${state.portDirectory}/patches/`)
+  ));
+  if (candidates.length === 0) throw new Error('AI did not change NPMBUILD or patches');
+  run('git', ['add', '-A', '--', ...candidates]);
+  run('git', ['clean', '-fdx', '--', state.portDirectory]);
+  const staged = output('git', ['diff', '--cached', '--name-only', 'HEAD', '--']).split('\n').filter(Boolean);
+  assertPortPaths(staged, state.portDirectory);
+  run('git', ['diff', '--cached', '--check', 'HEAD', '--']);
+}
+
 function verify(env = process.env) {
   const state = loadState(env);
   if (output('git', ['rev-parse', 'HEAD']) !== state.headSha) {
@@ -213,10 +227,7 @@ function verify(env = process.env) {
   }
   const current = JSON.parse(output('cli/npm-ports', ['info', state.portDirectory, '--json']));
   assertTargetVersion(state.port, current);
-  const paths = changedPaths();
-  if (paths.length === 0) throw new Error('AI did not produce any changes');
-  assertPortPaths(paths, state.portDirectory);
-  run('git', ['diff', '--check', 'HEAD', '--']);
+  stageRepair(state);
   try {
     run('docker', [
       ...dockerArguments(state, env),
@@ -224,10 +235,13 @@ function verify(env = process.env) {
     ]);
   } finally {
     restoreOwnership(env);
+    run('git', ['clean', '-fdx', '--', state.portDirectory]);
+  }
+  if (output('git', ['diff', '--name-only'])) {
+    throw new Error('The independent build modified tracked files after the repair was staged');
   }
   const patch = `${reportDirectory(env)}/repair.patch`;
   rmSync(patch, { force: true });
-  run('git', ['add', '--', state.portDirectory]);
   assertPortPaths(output('git', ['diff', '--cached', '--name-only', 'HEAD', '--']).split('\n').filter(Boolean), state.portDirectory);
   run('git', ['diff', '--cached', '--binary', '--full-index', `--output=${patch}`, 'HEAD', '--', state.portDirectory]);
   writeFile(statePath(env), `${JSON.stringify({ ...state, verified: true, patch }, null, 2)}\n`);

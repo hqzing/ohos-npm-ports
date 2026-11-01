@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import {
   assertPortPaths,
   assertTargetVersion,
   singlePortDirectory,
+  stageRepair,
 } from '../.github/scripts/ai-bump.mjs';
 
 const workflow = readFileSync('.github/workflows/ai-bump.yml', 'utf8');
@@ -24,16 +28,61 @@ test('AI bump accepts exactly one port including a version-line slot', () => {
   assert.throws(() => singlePortDirectory([]), /no changed files/);
 });
 
-test('AI repair cannot modify files outside the selected port', () => {
+test('AI repair only accepts NPMBUILD and patches, never build outputs', () => {
   assert.doesNotThrow(() => assertPortPaths([
     'ports/b/bufferutil/NPMBUILD',
     'ports/b/bufferutil/patches/new.patch',
   ], 'ports/b/bufferutil'));
-  assert.throws(() => assertPortPaths([
-    'ports/b/bufferutil/NPMBUILD',
+  for (const path of [
     'cli/build.mjs',
-  ], 'ports/b/bufferutil'), /outside/);
-  assert.throws(() => assertPortPaths(['ports/b/bufferutil-other/file'], 'ports/b/bufferutil'), /outside/);
+    'ports/b/bufferutil-other/file',
+    'ports/b/bufferutil/bufferutil-4.1.0/package.json',
+    'ports/b/bufferutil/package/package.json',
+    'ports/b/bufferutil/bufferutil-4.1.0.tar.gz',
+    'ports/b/bufferutil/ohos/helper.cjs',
+  ]) {
+    assert.throws(() => assertPortPaths([path], 'ports/b/bufferutil'), /only allows NPMBUILD and patches/);
+  }
+});
+
+test('staging keeps source repairs and removes untracked build outputs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-bump-stage-'));
+  const previous = process.cwd();
+  const write = (path, text) => {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), text);
+  };
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+  try {
+    git('init', '-q');
+    git('config', 'user.name', 'Test');
+    git('config', 'user.email', 'test@example.com');
+    write('ports/b/bufferutil/NPMBUILD', 'version="4.0.9"\n');
+    write('ports/b/bufferutil/patches/0001-update-package-json.patch', 'old patch\n');
+    git('add', '.');
+    git('commit', '-qm', 'initial');
+
+    write('ports/b/bufferutil/NPMBUILD', 'version="4.1.0"\n');
+    write('ports/b/bufferutil/patches/0002-openharmony.patch', 'new patch\n');
+    write('ports/b/bufferutil/bufferutil-4.1.0/package.json', '{}\n');
+    write('ports/b/bufferutil/package/package.json', '{}\n');
+    write('ports/b/bufferutil/bufferutil-4.1.0.tar.gz', 'archive\n');
+    write('ports/b/bufferutil/artifacts/ignored.tgz', 'artifact\n');
+
+    process.chdir(root);
+    stageRepair({ portDirectory: 'ports/b/bufferutil' });
+    assert.deepEqual(git('diff', '--cached', '--name-only').split('\n'), [
+      'ports/b/bufferutil/NPMBUILD',
+      'ports/b/bufferutil/patches/0002-openharmony.patch',
+    ]);
+    assert.deepEqual(git('status', '--porcelain').split('\n'), [
+      'M  ports/b/bufferutil/NPMBUILD',
+      'A  ports/b/bufferutil/patches/0002-openharmony.patch',
+    ]);
+  } finally {
+    process.chdir(previous);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('AI repair cannot fix a bump by restoring the old version', () => {
