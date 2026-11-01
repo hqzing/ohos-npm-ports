@@ -1,14 +1,17 @@
 import { execFileSync } from 'node:child_process';
 import {
   appendFileSync,
+  chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const image = 'ghcr.io/ohos-npm-ports/ci-runner:latest';
@@ -79,8 +82,8 @@ export function singlePortDirectory(paths) {
 
 export function assertPortPaths(paths, portDirectory) {
   for (const path of paths) {
-    if (path !== `${portDirectory}/NPMBUILD` && !path.startsWith(`${portDirectory}/patches/`)) {
-      throw new Error(`AI bump only allows NPMBUILD and patches changes: ${path}`);
+    if (!path.startsWith(`${portDirectory}/`)) {
+      throw new Error(`AI changed a file outside ${portDirectory}: ${path}`);
     }
   }
 }
@@ -91,10 +94,33 @@ export function assertTargetVersion(before, after) {
   }
 }
 
-function changedPaths() {
-  const tracked = output('git', ['diff', '--name-only', '-z', 'HEAD', '--']);
-  const untracked = output('git', ['ls-files', '--others', '--exclude-standard', '-z']);
-  return [...new Set(`${tracked}\0${untracked}`.split('\0').filter(Boolean))];
+function declaredNewFiles(state, env) {
+  const root = `${reportDirectory(env)}/new-files`;
+  if (!existsSync(root)) return [];
+  if (!lstatSync(root).isDirectory()) throw new Error('new-files must be a real directory');
+  const files = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const source = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(source);
+        continue;
+      }
+      if (!entry.isFile()) throw new Error(`New source files must be regular files: ${source}`);
+      const path = relative(root, source);
+      assertPortPaths([path], state.portDirectory);
+      if (output('git', ['ls-files', '--', path])) {
+        throw new Error(`A declared new file already exists in the PR: ${path}`);
+      }
+      const destination = resolve(env.GITHUB_WORKSPACE, path);
+      mkdirSync(dirname(destination), { recursive: true });
+      copyFileSync(source, destination);
+      chmodSync(destination, lstatSync(source).mode);
+      files.push(path);
+    }
+  };
+  visit(root);
+  return files.sort();
 }
 
 function restoreOwnership(env = process.env) {
@@ -169,7 +195,7 @@ function promptFor(state) {
   return `你需要修复一个 npm 包移植到 OpenHarmony 后的自动版本升级 PR。
 
 仓库位于 /workspace，PR 标题：${state.title}
-只允许修改 ${state.portDirectory}/NPMBUILD 和 ${state.portDirectory}/patches/ 内的文件。目标上游版本必须保持为 ${state.port.version}，不得通过降级、删除测试、跳过检查或屏蔽错误来制造成功。构建产生的其他文件不会进入修复补丁。
+只允许修改 ${state.portDirectory}/ 内已有 Git 跟踪的源文件。若需要新增源文件，修复完成后必须按仓库相对路径把最终内容复制到 /report/new-files/，例如 /report/new-files/${state.portDirectory}/test.js 或 /report/new-files/${state.portDirectory}/ohos/helper.cjs。未按此声明的工作区新文件会作为构建产物清理。目标上游版本必须保持为 ${state.port.version}，不得通过降级、删除测试、跳过检查或屏蔽错误来制造成功。
 
 先执行 cli/npm-ports check ${state.portDirectory} 复现失败。查看 git diff HEAD^ HEAD 了解本次升级，检查现有补丁和构建参数，必要时对照上游同版本源码与变更。保留已有的 OpenHarmony 适配，不要修改其他 port、CLI、文档或工作流，不要执行 git commit 或 git push，不要读取或输出 DEEPSEEK_API_KEY。
 
@@ -206,13 +232,11 @@ dsh --profile headless "$(cat /report/prompt.txt)"`;
   }
 }
 
-export function stageRepair(state) {
+export function stageRepair(state, env = process.env) {
   const tracked = output('git', ['diff', '--name-only', '-z', 'HEAD', '--']).split('\0').filter(Boolean);
   assertPortPaths(tracked, state.portDirectory);
-  const candidates = changedPaths().filter((path) => (
-    path === `${state.portDirectory}/NPMBUILD` || path.startsWith(`${state.portDirectory}/patches/`)
-  ));
-  if (candidates.length === 0) throw new Error('AI did not change NPMBUILD or patches');
+  const candidates = [...tracked, ...declaredNewFiles(state, env)];
+  if (candidates.length === 0) throw new Error('AI did not change tracked source files or declare new source files');
   run('git', ['add', '-A', '--', ...candidates]);
   run('git', ['clean', '-fdx', '--', state.portDirectory]);
   const staged = output('git', ['diff', '--cached', '--name-only', 'HEAD', '--']).split('\n').filter(Boolean);
@@ -227,7 +251,7 @@ function verify(env = process.env) {
   }
   const current = JSON.parse(output('cli/npm-ports', ['info', state.portDirectory, '--json']));
   assertTargetVersion(state.port, current);
-  stageRepair(state);
+  stageRepair(state, env);
   try {
     run('docker', [
       ...dockerArguments(state, env),

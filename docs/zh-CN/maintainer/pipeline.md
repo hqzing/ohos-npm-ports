@@ -86,7 +86,7 @@ bump 只根据 `upstream` 查询 npm registry。主 port 跟随指定 dist-tag�
 
 bump 构建失败后，维护者可以添加 `request-ai-bump` 标签请求 AI 修复。工作流只接受同仓库、机器人创建、目标为 main 且只修改一个 port 的单提交 PR，并检查标签操作者具有写权限。开始后触发标签会被移除，执行状态直接查看 PR Checks，不维护额外状态标签。
 
-AI 只能修改该 port 的 `NPMBUILD` 和 `patches/`，且必须保持目标版本。工作流会清理未跟踪的构建产物，独立执行 `npm-ports lint` 和 `npm-ports check`，再从全新克隆应用修复补丁、amend 原提交并使用 force-with-lease 推送。AI 容器不接触 App 或仓库凭据，AI 自己声明成功不能代替真实构建。推送后的完整 CI 仍是合并前的必要检查。
+AI 可以修改该 port 内已有 Git 跟踪的骨架文件，包括 `test.js`、补丁和辅助代码，且必须保持目标版本。新增源文件由 AI 按仓库相对路径显式写入报告目录，宿主校验后加入验证，其他未跟踪文件作为构建产物清理。工作流独立执行 `npm-ports lint` 和 `npm-ports check`，再从全新克隆应用修复补丁、amend 原提交并使用 force-with-lease 推送。AI 容器不接触 App 或仓库凭据，AI 自己声明成功不能代替真实构建。推送后的完整 CI 仍是合并前的必要检查。
 
 ## 8. 验证边界
 

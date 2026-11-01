@@ -28,24 +28,18 @@ test('AI bump accepts exactly one port including a version-line slot', () => {
   assert.throws(() => singlePortDirectory([]), /no changed files/);
 });
 
-test('AI repair only accepts NPMBUILD and patches, never build outputs', () => {
+test('AI repair accepts any source file inside the selected port only', () => {
   assert.doesNotThrow(() => assertPortPaths([
     'ports/b/bufferutil/NPMBUILD',
     'ports/b/bufferutil/patches/new.patch',
-  ], 'ports/b/bufferutil'));
-  for (const path of [
-    'cli/build.mjs',
-    'ports/b/bufferutil-other/file',
-    'ports/b/bufferutil/bufferutil-4.1.0/package.json',
-    'ports/b/bufferutil/package/package.json',
-    'ports/b/bufferutil/bufferutil-4.1.0.tar.gz',
+    'ports/b/bufferutil/test.js',
     'ports/b/bufferutil/ohos/helper.cjs',
-  ]) {
-    assert.throws(() => assertPortPaths([path], 'ports/b/bufferutil'), /only allows NPMBUILD and patches/);
-  }
+  ], 'ports/b/bufferutil'));
+  assert.throws(() => assertPortPaths(['cli/build.mjs'], 'ports/b/bufferutil'), /outside/);
+  assert.throws(() => assertPortPaths(['ports/b/bufferutil-other/file'], 'ports/b/bufferutil'), /outside/);
 });
 
-test('staging keeps source repairs and removes untracked build outputs', () => {
+test('staging keeps tracked and declared source files and removes build outputs', () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-bump-stage-'));
   const previous = process.cwd();
   const write = (path, text) => {
@@ -63,21 +57,30 @@ test('staging keeps source repairs and removes untracked build outputs', () => {
     git('commit', '-qm', 'initial');
 
     write('ports/b/bufferutil/NPMBUILD', 'version="4.1.0"\n');
-    write('ports/b/bufferutil/patches/0002-openharmony.patch', 'new patch\n');
+    write('report/new-files/ports/b/bufferutil/patches/0002-openharmony.patch', 'new patch\n');
+    write('report/new-files/ports/b/bufferutil/test.js', 'console.log("test");\n');
+    write('report/new-files/ports/b/bufferutil/ohos/helper.cjs', 'module.exports = {};\n');
     write('ports/b/bufferutil/bufferutil-4.1.0/package.json', '{}\n');
     write('ports/b/bufferutil/package/package.json', '{}\n');
     write('ports/b/bufferutil/bufferutil-4.1.0.tar.gz', 'archive\n');
     write('ports/b/bufferutil/artifacts/ignored.tgz', 'artifact\n');
 
     process.chdir(root);
-    stageRepair({ portDirectory: 'ports/b/bufferutil' });
+    stageRepair(
+      { portDirectory: 'ports/b/bufferutil' },
+      { AI_BUMP_REPORT_DIR: join(root, 'report'), GITHUB_WORKSPACE: root },
+    );
     assert.deepEqual(git('diff', '--cached', '--name-only').split('\n'), [
       'ports/b/bufferutil/NPMBUILD',
+      'ports/b/bufferutil/ohos/helper.cjs',
       'ports/b/bufferutil/patches/0002-openharmony.patch',
+      'ports/b/bufferutil/test.js',
     ]);
-    assert.deepEqual(git('status', '--porcelain').split('\n'), [
+    assert.deepEqual(git('status', '--porcelain', '--', 'ports/b/bufferutil').split('\n'), [
       'M  ports/b/bufferutil/NPMBUILD',
+      'A  ports/b/bufferutil/ohos/helper.cjs',
       'A  ports/b/bufferutil/patches/0002-openharmony.patch',
+      'A  ports/b/bufferutil/test.js',
     ]);
   } finally {
     process.chdir(previous);
