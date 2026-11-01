@@ -8,7 +8,7 @@ bump 和 AI 修复工作流使用 GitHub App 创建、更新 PR。GitHub 为防�
 
 打开账户或组织的 **Settings → Developer settings → GitHub Apps → New GitHub App**：
 
-- Name：`ohos-npm-ports-bump`
+- Name：`ohos-npm-ports-automation`
 - Homepage：`https://github.com/ohos-npm-ports/ohos-npm-ports`
 - Webhook：取消 **Active**
 - Repository permissions：
@@ -30,8 +30,8 @@ bump 和 AI 修复工作流使用 GitHub App 创建、更新 PR。GitHub 为防�
 
 进入仓库 **Settings → Secrets and variables → Actions**，添加：
 
-- `BUMP_APP_ID`：App ID
-- `BUMP_APP_PRIVATE_KEY`：完整 PEM，包括 BEGIN/END 和所有换行
+- `AUTOMATION_APP_ID`：App ID
+- `AUTOMATION_APP_PRIVATE_KEY`：完整 PEM，包括 BEGIN/END 和所有换行
 - `DEEPSEEK_API_KEY`：AI 修复使用的 DeepSeek API 密钥
 
 不需要 Installation ID，也不要把私钥或 API 密钥写入仓库或聊天记录。

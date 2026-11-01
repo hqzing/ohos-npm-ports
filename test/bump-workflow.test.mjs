@@ -31,8 +31,8 @@ test('ready-for-review triggers both CI and port lint without a PAT', () => {
 
 test('GitHub App creates ordinary bump PRs that trigger CI automatically', () => {
   assert.match(bump, /actions\/create-github-app-token@v2/);
-  assert.match(bump, /app-id: \$\{\{ secrets\.BUMP_APP_ID \}\}/);
-  assert.match(bump, /private-key: \$\{\{ secrets\.BUMP_APP_PRIVATE_KEY \}\}/);
+  assert.match(bump, /app-id: \$\{\{ secrets\.AUTOMATION_APP_ID \}\}/);
+  assert.match(bump, /private-key: \$\{\{ secrets\.AUTOMATION_APP_PRIVATE_KEY \}\}/);
   assert.match(bump, /token: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   assert.match(bump, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   assert.match(bump, /--no-draft/);
