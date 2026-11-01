@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
     env:
-      AI_BUMP_STATE: ${{ runner.temp }}/ai-bump-state.json
-      AI_BUMP_REPORT_DIR: ${{ runner.temp }}/ai-bump-report
+      AI_BUMP_STATE: /tmp/ai-bump-state.json
+      AI_BUMP_REPORT_DIR: /tmp/ai-bump-report
     steps:
       - uses: actions/checkout@v7
         with:
