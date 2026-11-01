@@ -119,3 +119,15 @@ test('publishing applies the verified patch in a fresh clone', () => {
   const publish = script.slice(script.indexOf('function publish'), script.indexOf('function finalize'));
   assert.doesNotMatch(publish, /AI_BUMP_PUSH_TOKEN|DEEPSEEK_API_KEY/);
 });
+
+test('AI containers configure PATH and use the documented npm-ports command', () => {
+  const prompt = script.slice(script.indexOf('function promptFor'), script.indexOf('function repair'));
+  const repair = script.slice(script.indexOf('function repair'), script.indexOf('function stageRepair'));
+  const verify = script.slice(script.indexOf('function verify'), script.indexOf('function comment'));
+  assert.match(prompt, /npm-ports lint \$\{state\.portDirectory\}/);
+  assert.match(prompt, /npm-ports check \$\{state\.portDirectory\}/);
+  assert.doesNotMatch(prompt, /cli\/npm-ports/);
+  assert.match(repair, /export PATH="\/workspace\/cli:\$PATH"/);
+  assert.match(verify, /export PATH="\/workspace\/cli:\$PATH"/);
+  assert.match(verify, /npm-ports lint "\$1" && npm-ports check "\$1"/);
+});
