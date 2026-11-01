@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import {
   appendFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -26,6 +27,7 @@ function output(command, args) {
 
 function writeFile(path, text) {
   mkdirSync(dirname(path), { recursive: true });
+  rmSync(path, { force: true });
   writeFileSync(path, text);
 }
 
@@ -53,7 +55,9 @@ function clip(text, limit = 50000) {
 }
 
 function readIfPresent(path) {
-  return existsSync(path) ? readFileSync(path, 'utf8').trim() : '';
+  if (!existsSync(path)) return '';
+  if (!lstatSync(path).isFile()) throw new Error(`Expected a regular file: ${path}`);
+  return readFileSync(path, 'utf8').trim();
 }
 
 function reportBody(state, env = process.env) {
@@ -193,8 +197,9 @@ dsh --profile headless "$(cat /report/prompt.txt)"`;
       image, 'sh', '-lc', script,
     ]);
     const reportPath = `${reports}/report.md`;
-    if (existsSync(reportPath) && env.DEEPSEEK_API_KEY) {
-      writeFileSync(reportPath, readFileSync(reportPath, 'utf8').split(env.DEEPSEEK_API_KEY).join('***'));
+    const report = readIfPresent(reportPath);
+    if (report && env.DEEPSEEK_API_KEY) {
+      writeFile(reportPath, report.split(env.DEEPSEEK_API_KEY).join('***'));
     }
   } finally {
     restoreOwnership(env);
@@ -221,6 +226,7 @@ function verify(env = process.env) {
     restoreOwnership(env);
   }
   const patch = `${reportDirectory(env)}/repair.patch`;
+  rmSync(patch, { force: true });
   run('git', ['add', '--', state.portDirectory]);
   assertPortPaths(output('git', ['diff', '--cached', '--name-only', 'HEAD', '--']).split('\n').filter(Boolean), state.portDirectory);
   run('git', ['diff', '--cached', '--binary', '--full-index', `--output=${patch}`, 'HEAD', '--', state.portDirectory]);
