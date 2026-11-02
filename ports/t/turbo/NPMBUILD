@@ -1,238 +1,191 @@
-#!/usr/bin/env bash
-pkgname="turbo"
-upstream="turbo"
-version="2.11.10"
-revision=1
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { Port, resource, run, cd, fetchSource, fetchResource, writeJson, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
-packages=(
-  "turbo-${version}"
-)
-ghostty_commit=5147c0a503cdeed7615cce245cdd815ed7a6b692
-rust_nightly=2026-07-03
-source="https://codeload.github.com/vercel/turborepo/tar.gz/refs/tags/v${version}"
-sha256="a9786d3236e75aa32aac690018e6282952f9ef252f541274798c181dc1550b64"
-resource "zig" \
-  "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz" \
-  "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
-resource "rust_nightly" \
-  "https://static.rust-lang.org/dist/${rust_nightly}/rust-nightly-aarch64-unknown-linux-ohos.tar.gz" \
-  "3191de904f37ab70d64fe7b125b7d0f77ed5f6570ca409582f6966d1672174d9"
-resource "ghostty" \
-  "https://codeload.github.com/ghostty-org/ghostty/tar.gz/${ghostty_commit}" \
-  "71c5b5d2ad2a2351dba79725c428a3065b51addc533ca8ec88114f1a9cfa7b10"
+const version = '2.11.10';
+const ghosttyCommit = '5147c0a503cdeed7615cce245cdd815ed7a6b692';
+const rustNightly = '2026-07-03';
+const zigVersion = '0.17.0';
+const rootDir = import.meta.dirname;
+const sourceDir = join(rootDir, `turborepo-${version}`);
+const packageDir = join(rootDir, `turbo-${version}`);
 
-build() {
-  # Source build of turbo for OpenHarmony (no prebuilt binaries): the Rust CLI
-  # (crates/turborepo) and the TUI's libghostty-vt (via zig) compile natively on
-  # an OHOS host; the JS launcher is the patched packages/turbo/bin/turbo.
+function cargoCrate(name) {
+  const registry = join(homedir(), '.cargo/registry/src');
+  for (const directory of readdirSync(registry).sort()) {
+    const candidate = join(registry, directory, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(`Cargo crate not found: ${name}`);
+}
 
-  # Must match the pinned commit in crates/libghostty-vt-sys/build.rs.
-  # Matches rust-toolchain.toml; the tree uses #![feature(...)] and -Z rustflags,
-  # so stable rustc cannot build it.
+function makeWritable(directory) {
+  chmodSync(directory, statSync(directory).mode | 0o200);
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const file = join(directory, entry.name);
+    if (entry.isDirectory()) makeWritable(file);
+    else chmodSync(file, statSync(file).mode | 0o200);
+  }
+}
 
-  # Large downloads intermittently stall or die mid-transfer on some networks.
+export default class Turbo extends Port {
+  static pkgname = 'turbo';
+  static upstream = 'turbo';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static source = `https://codeload.github.com/vercel/turborepo/tar.gz/refs/tags/v${version}`;
+  static sha256 = 'a9786d3236e75aa32aac690018e6282952f9ef252f541274798c181dc1550b64';
+  static resources = [
+    resource(
+      'zig',
+      `https://ziglang.org/download/${zigVersion}/zig-aarch64-linux-${zigVersion}.tar.xz`,
+      '9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8',
+    ),
+    resource(
+      'rust_nightly',
+      `https://static.rust-lang.org/dist/${rustNightly}/rust-nightly-aarch64-unknown-linux-ohos.tar.gz`,
+      '3191de904f37ab70d64fe7b125b7d0f77ed5f6570ca409582f6966d1672174d9',
+    ),
+    resource(
+      'ghostty',
+      `https://codeload.github.com/ghostty-org/ghostty/tar.gz/${ghosttyCommit}`,
+      '71c5b5d2ad2a2351dba79725c428a3065b51addc533ca8ec88114f1a9cfa7b10',
+    ),
+  ];
+  static packages = [`turbo-${version}`];
 
-  # --- toolchain dependencies ---
-  # protoc for turborepo-daemon's tonic-prost-build, capnp for the embedded
-  # sccache, openssl@3/libxml2/zlib for rust-nightly's cargo and rust-lld.
-  brew install -y protobuf capnp openssl@3 libxml2 zlib
+  prepare() {
+    run('brew', ['install', '-y', 'protobuf', 'capnp', 'openssl@3', 'libxml2', 'zlib']);
+    const zigDir = join(rootDir, `zig-aarch64-linux-${zigVersion}`);
+    fetchResource('zig', join(rootDir, 'zig.tar.xz'));
+    run('tar', ['-xJf', join(rootDir, 'zig.tar.xz')], { cwd: rootDir });
+    rmSync(join(rootDir, 'zig.tar.xz'), { force: true });
+    chmodSync(join(zigDir, 'zig'), 0o755);
+    process.env.PATH = `${zigDir}:${process.env.PATH}`;
+    process.env.ZIG_GLOBAL_CACHE_DIR = join(rootDir, 'zig-cache');
 
-  # zig for the TUI's libghostty-vt (ghostty's pinned commit requires
-  # >= 0.17.0). Official static tarball; zig finds its lib/ via its own
-  # realpath, so keep the extracted tree intact.
-  zig_version=0.17.0
-  zig_dir="zig-aarch64-linux-${zig_version}"
-  fetch_resource "zig" "zig.tar.xz"
-  tar -xJf zig.tar.xz
-  rm zig.tar.xz
-  chmod +x "${zig_dir}/zig"
-  export PATH="$(pwd)/${zig_dir}:$PATH"
-  # Keep zig's cache inside the working directory: /data/storage/... only
-  # exists on OHOS hosts, and $PWD works in both CI containers and devices.
-  export ZIG_GLOBAL_CACHE_DIR="$(pwd)/zig-cache"
+    fetchResource('rust_nightly', join(rootDir, 'rust-nightly.tar.gz'));
+    const extractDir = join(rootDir, 'rust-nightly-extract');
+    mkdirSync(extractDir, { recursive: true });
+    run('tar', ['-zxf', join(rootDir, 'rust-nightly.tar.gz'), '-C', extractDir, '--strip-components=1']);
+    rmSync(join(rootDir, 'rust-nightly.tar.gz'), { force: true });
+    const rustHome = join(rootDir, 'rust-nightly');
+    run('sh', [
+      join(extractDir, 'install.sh'),
+      `--prefix=${rustHome}`,
+      '--disable-ldconfig',
+      '--components=rustc,cargo,rust-std-aarch64-unknown-linux-ohos',
+    ]);
+    rmSync(extractDir, { recursive: true, force: true });
+    process.env.PATH = `${join(rustHome, 'bin')}:${process.env.PATH}`;
+    const openssl = run('brew', ['--prefix', 'openssl@3'], { capture: true }).stdout.trim();
+    const libxml2 = run('brew', ['--prefix', 'libxml2'], { capture: true }).stdout.trim();
+    const zlib = run('brew', ['--prefix', 'zlib'], { capture: true }).stdout.trim();
+    const brewPrefix = run('brew', ['--prefix'], { capture: true }).stdout.trim();
+    process.env.LD_LIBRARY_PATH = [join(openssl, 'lib'), join(libxml2, 'lib'), join(zlib, 'lib')].join(':');
+    process.env.CARGO_HTTP_CAINFO = join(brewPrefix, 'etc/openssl@3/cert.pem');
+    run('cargo', ['--version']);
 
-  # --- rust nightly toolchain (upstream-pinned channel) ---
-  fetch_resource "rust_nightly" "rust-nightly.tar.gz"
-  mkdir -p rust-nightly-extract
-  tar -zxf rust-nightly.tar.gz -C rust-nightly-extract --strip-components=1
-  rm rust-nightly.tar.gz
-  rust_home="$(pwd)/rust-nightly"
-  sh rust-nightly-extract/install.sh --prefix="${rust_home}" --disable-ldconfig \
-    --components=rustc,cargo,rust-std-aarch64-unknown-linux-ohos
-  rm -rf rust-nightly-extract
-
-  export PATH="${rust_home}/bin:$PATH"
-  export LD_LIBRARY_PATH="$(brew --prefix openssl@3)/lib:$(brew --prefix libxml2)/lib:$(brew --prefix zlib)/lib"
-  # rust-nightly's cargo verifies TLS against the system OpenSSL trust store,
-  # which is empty on OHOS; point it at harmonybrew's CA bundle.
-  export CARGO_HTTP_CAINFO="$(brew --prefix)/etc/openssl@3/cert.pem"
-  cargo --version
-
-  # --- sources ---
-  # Tarballs instead of git clone: the CI image has no git binary (cargo's own
-  # git deps go through libgit2, so they don't need it either).
-  fetch_source "turborepo.tar.gz"
-  mkdir -p "turborepo-${version}"
-  tar -zxf turborepo.tar.gz -C "turborepo-${version}" --strip-components=1
-  rm turborepo.tar.gz
-
-  # libghostty-vt-sys's build.rs git-clones ghostty at this pinned commit;
-  # pre-seed via GHOSTTY_SOURCE_DIR (no git binary here).
-  fetch_resource "ghostty" "ghostty.tar.gz"
-  mkdir -p ghostty-src
-  tar -zxf ghostty.tar.gz -C ghostty-src --strip-components=1
-  rm ghostty.tar.gz
-  export ghostty_source_dir="$(pwd)/ghostty-src"
-
-  cd "turborepo-${version}"
-  patch -p1 <../patches/0002-openharmony-wrapper.patch
-  patch -p1 <../patches/0005-libghostty-vt-sys-ohos-zig-target.patch
-
-  # Vendor the three crates that need OHOS fixes (same pattern bun-pty uses for
-  # portable-pty), then wire up [patch.crates-io] + Cargo.lock via 0003/0004.
-  cargo fetch
-  mkdir -p vendor
-  rm -rf vendor/nix vendor/zstd-sys vendor/aws-lc-sys
-  # Machines with a configured cargo mirror have multiple registry src dirs.
-  cp -r "$(ls -d "$HOME"/.cargo/registry/src/*/nix-0.26.2 | head -1)" vendor/nix
-  cp -r "$(ls -d "$HOME"/.cargo/registry/src/*/zstd-sys-2.0.16+zstd.1.5.7 | head -1)" vendor/zstd-sys
-  cp -r "$(ls -d "$HOME"/.cargo/registry/src/*/aws-lc-sys-0.46.0 | head -1)" vendor/aws-lc-sys
-  chmod -R u+w vendor/nix vendor/zstd-sys vendor/aws-lc-sys
-  (cd vendor/nix && patch -p1 <../../../patches/0006-nix-0.26.2-ohos.patch)
-  (cd vendor/zstd-sys && patch -p1 <../../../patches/0007-zstd-sys-ohos-qsort.patch)
-  (cd vendor/aws-lc-sys && patch -p1 <../../../patches/0008-aws-lc-sys-ohos-cc-builder.patch)
-
-  patch -p1 <../patches/0003-workspace-cargo-manifest.patch
-  patch -p1 <../patches/0004-cargo-lock.patch
-
-  # --- build ---
-  cargo build --release --locked -p turbo
-  test -f target/release/turbo
-
-  # --- assemble the npm package ---
-  # Mirror the published `turbo` package layout. schema.json is gitignored in
-  # the repo (generated at release time); the turbo-types copy is
-  # byte-identical to the published one.
-  cd ..
-  package_dir="${pkgname}-${version}"
-  mkdir -p "${package_dir}/bin"
-  cp "turborepo-${version}/packages/turbo/package.json" \
-    "turborepo-${version}/packages/turbo/README.md" \
-    "turborepo-${version}/LICENSE" \
-    "${package_dir}/"
-  cp "turborepo-${version}/packages/turbo/bin/turbo" "${package_dir}/bin/turbo"
-  chmod +x "${package_dir}/bin/turbo"
-  cp "turborepo-${version}/packages/turbo-types/schemas/schema.json" "${package_dir}/schema.json"
-
-  llvm-strip --strip-all "turborepo-${version}/target/release/turbo" -o "${package_dir}/bin/turbo-linux-arm64"
-  chmod +x "${package_dir}/bin/turbo-linux-arm64"
-
-  cd "${package_dir}"
-
-  # --- verify package contents ---
-
-  # toybox patch can silently no-op on a malformed header, so confirm the
-  # patches actually landed rather than trusting patch's exit code.
-  grep -q 'turbo-linux-arm64' bin/turbo
-  grep -q 'platform === "openharmony"' bin/turbo
-
-  # --- functional smoke test ---
-  # Real launcher -> embedded binary path: version check, then a minimal
-  # monorepo build — real execution on run 1, full cache hit on run 2.
-
-  version_out=$(node bin/turbo --version)
-  [ "$version_out" = "${version}" ] || {
-    echo "unexpected version: $version_out" >&2
-    exit 1
+    fetchSource(join(rootDir, 'turborepo.tar.gz'));
+    mkdirSync(sourceDir, { recursive: true });
+    run('tar', ['-zxf', join(rootDir, 'turborepo.tar.gz'), '-C', sourceDir, '--strip-components=1']);
+    rmSync(join(rootDir, 'turborepo.tar.gz'), { force: true });
+    fetchResource('ghostty', join(rootDir, 'ghostty.tar.gz'));
+    const ghosttyDir = join(rootDir, 'ghostty-src');
+    mkdirSync(ghosttyDir, { recursive: true });
+    run('tar', ['-zxf', join(rootDir, 'ghostty.tar.gz'), '-C', ghosttyDir, '--strip-components=1']);
+    rmSync(join(rootDir, 'ghostty.tar.gz'), { force: true });
+    process.env.ghostty_source_dir = ghosttyDir;
   }
 
-  # The smoke workspace deliberately lives outside this checkout: the CI image
-  # has no git binary, and turbo's input hashing + cache persistence behave
-  # differently depending on whether it finds a .git dir above the workspace.
-  smoke_dir=$(mktemp -d)
-  log_dir="$(pwd)"
-  mkdir -p "${smoke_dir}/packages/pkg-a" "${smoke_dir}/packages/pkg-b"
+  build() {
+    cd(sourceDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0002-openharmony-wrapper.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0005-libghostty-vt-sys-ohos-zig-target.patch')) });
+    run('cargo', ['fetch']);
+    mkdirSync(join(sourceDir, 'vendor'), { recursive: true });
+    for (const name of ['nix', 'zstd-sys', 'aws-lc-sys']) rmSync(join(sourceDir, 'vendor', name), { recursive: true, force: true });
+    cpSync(cargoCrate('nix-0.26.2'), join(sourceDir, 'vendor/nix'), { recursive: true });
+    cpSync(cargoCrate('zstd-sys-2.0.16+zstd.1.5.7'), join(sourceDir, 'vendor/zstd-sys'), { recursive: true });
+    cpSync(cargoCrate('aws-lc-sys-0.46.0'), join(sourceDir, 'vendor/aws-lc-sys'), { recursive: true });
+    for (const name of ['nix', 'zstd-sys', 'aws-lc-sys']) makeWritable(join(sourceDir, 'vendor', name));
+    run('patch', ['-p1'], { cwd: join(sourceDir, 'vendor/nix'), input: readFileSync(join(rootDir, 'patches/0006-nix-0.26.2-ohos.patch')) });
+    run('patch', ['-p1'], { cwd: join(sourceDir, 'vendor/zstd-sys'), input: readFileSync(join(rootDir, 'patches/0007-zstd-sys-ohos-qsort.patch')) });
+    run('patch', ['-p1'], { cwd: join(sourceDir, 'vendor/aws-lc-sys'), input: readFileSync(join(rootDir, 'patches/0008-aws-lc-sys-ohos-cc-builder.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0003-workspace-cargo-manifest.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0004-cargo-lock.patch')) });
+    run('cargo', ['build', '--release', '--locked', '-p', 'turbo']);
+    assert.ok(statSync(join(sourceDir, 'target/release/turbo')).size > 0);
+  }
 
-  cat >"${smoke_dir}/package.json" <<'EOF'
-{
-  "name": "turbo-smoke",
-  "private": true,
-  "packageManager": "npm@10.0.0",
-  "workspaces": [
-    "packages/*"
-  ]
-}
-EOF
+  package() {
+    mkdirSync(join(packageDir, 'bin'), { recursive: true });
+    for (const file of ['packages/turbo/package.json', 'packages/turbo/README.md', 'LICENSE']) {
+      copyFileSync(join(sourceDir, file), join(packageDir, file.split('/').at(-1)));
+    }
+    copyFileSync(join(sourceDir, 'packages/turbo/bin/turbo'), join(packageDir, 'bin/turbo'));
+    chmodSync(join(packageDir, 'bin/turbo'), 0o755);
+    copyFileSync(join(sourceDir, 'packages/turbo-types/schemas/schema.json'), join(packageDir, 'schema.json'));
+    run('llvm-strip', ['--strip-all', join(sourceDir, 'target/release/turbo'), '-o', join(packageDir, 'bin/turbo-linux-arm64')]);
+    chmodSync(join(packageDir, 'bin/turbo-linux-arm64'), 0o755);
+    const wrapper = readFileSync(join(packageDir, 'bin/turbo'), 'utf8');
+    assert.ok(wrapper.includes('turbo-linux-arm64'));
+    assert.ok(wrapper.includes('platform === "openharmony"'));
+  }
 
-  cat >"${smoke_dir}/turbo.json" <<'EOF'
-{
-  "$schema": "https://turborepo.dev/schema.json",
-  "tasks": {
-    "build": {
-      "outputs": ["dist/**"]
+  static testPlatforms = ['openharmony'];
+  static testPlatformReason = 'This port ships only an OpenHarmony arm64 native binary.';
+  static testTimeout = 600_000;
+
+  test() {
+    const context = recipeContext();
+    const pkg = requirePackage('turbo/package.json');
+    if (context.mode !== 'baseline') {
+      assert.equal(pkg.name, '@ohos-npm-ports/turbo');
+      assert.equal(pkg.version, context.portVersion);
+    }
+    const wrapper = join(dirname(context.resolvePackage('turbo/package.json')), 'bin/turbo');
+    assert.equal(run(process.execPath, [wrapper, '--version'], { capture: true }).stdout.trim(), version);
+    const smokeDir = mkdtempSync(join(tmpdir(), 'turbo-test-'));
+    try {
+      mkdirSync(join(smokeDir, 'packages/pkg-a'), { recursive: true });
+      mkdirSync(join(smokeDir, 'packages/pkg-b'), { recursive: true });
+      writeFileSync(join(smokeDir, 'package.json'), JSON.stringify({
+        name: 'turbo-smoke',
+        private: true,
+        packageManager: 'npm@10.0.0',
+        workspaces: ['packages/*'],
+      }, null, 2));
+      writeFileSync(join(smokeDir, 'turbo.json'), JSON.stringify({
+        $schema: 'https://turborepo.dev/schema.json',
+        tasks: { build: { outputs: ['dist/**'] } },
+      }, null, 2));
+      for (const name of ['pkg-a', 'pkg-b']) {
+        const directory = join(smokeDir, 'packages', name);
+        mkdirSync(join(directory, 'dist'), { recursive: true });
+        writeFileSync(join(directory, 'dist/out.txt'), `built-by-${name}\n`);
+        writeJson(join(directory, 'package.json'), {
+          name,
+          version: '0.0.0',
+          private: true,
+          scripts: { build: `mkdir -p dist && echo built-by-${name} > dist/out.txt` },
+        });
+      }
+      const options = { cwd: smokeDir, env: { TURBO_TELEMETRY_DISABLED: '1' }, capture: true };
+      run(process.execPath, [wrapper, 'run', 'build'], options);
+      const executed = run(process.execPath, [wrapper, 'run', 'build'], options);
+      assert.match(executed.stdout + executed.stderr, /cache miss, executing/);
+      assert.equal(readFileSync(join(smokeDir, 'packages/pkg-a/dist/out.txt'), 'utf8').trim(), 'built-by-pkg-a');
+      assert.equal(readFileSync(join(smokeDir, 'packages/pkg-b/dist/out.txt'), 'utf8').trim(), 'built-by-pkg-b');
+      const cached = run(process.execPath, [wrapper, 'run', 'build'], options);
+      assert.match(cached.stdout + cached.stderr, /FULL TURBO/);
+      return { result: { version: true, build: true, fullCacheHit: true }, assets: [] };
+    } finally {
+      rmSync(smokeDir, { recursive: true, force: true });
     }
   }
-}
-EOF
-
-  # Pre-create the outputs with the exact content the build scripts produce:
-  # without git, turbo hashes every workspace file as a task input, so the
-  # first run's own dist/ output would change the second run's input hash.
-  for p in pkg-a pkg-b; do
-    mkdir -p "${smoke_dir}/packages/${p}/dist"
-    echo "built-by-${p}" >"${smoke_dir}/packages/${p}/dist/out.txt"
-  done
-
-  for p in pkg-a pkg-b; do
-    cat >"${smoke_dir}/packages/${p}/package.json" <<EOF
-{
-  "name": "${p}",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "build": "mkdir -p dist && echo built-by-${p} > dist/out.txt"
-  }
-}
-EOF
-  done
-
-  export TURBO_TELEMETRY_DISABLED=1
-  wrapper="${log_dir}/bin/turbo"
-
-  cd "${smoke_dir}"
-  # Logs live outside the smoke workspace for the same hashing reason.
-  # The warm-up run absorbs two one-time, first-run-only transitions seen in a
-  # fresh git-less workspace (real-world repos have git and never see either):
-  # the first run's input hash differs from every later run's, and the first
-  # run doesn't persist its cache artifacts.
-  node "${wrapper}" run build >"${log_dir}/smoke-run0.log" 2>&1 || {
-    cat "${log_dir}/smoke-run0.log" >&2
-    exit 1
-  }
-
-  node "${wrapper}" run build >"${log_dir}/smoke-run1.log" 2>&1 || {
-    cat "${log_dir}/smoke-run1.log" >&2
-    exit 1
-  }
-  grep -q 'cache miss, executing' "${log_dir}/smoke-run1.log" || {
-    cat "${log_dir}/smoke-run1.log" >&2
-    exit 1
-  }
-  [ "$(cat packages/pkg-a/dist/out.txt)" = "built-by-pkg-a" ]
-  [ "$(cat packages/pkg-b/dist/out.txt)" = "built-by-pkg-b" ]
-
-  node "${wrapper}" run build >"${log_dir}/smoke-run2.log" 2>&1 || {
-    cat "${log_dir}/smoke-run2.log" >&2
-    exit 1
-  }
-  grep -q 'FULL TURBO' "${log_dir}/smoke-run2.log" || {
-    cat "${log_dir}/smoke-run2.log" >&2
-    exit 1
-  }
-  cd "${log_dir}"
-
-  rm -rf "${smoke_dir}" smoke-run0.log smoke-run1.log smoke-run2.log
-
-  echo "smoke test passed: real build executed, second run was a full cache hit"
 }

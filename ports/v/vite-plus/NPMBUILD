@@ -1,179 +1,188 @@
-#!/usr/bin/env bash
-pkgname="vite-plus"
-upstream="vite-plus"
-version="1.4.0"
-revision=4
-source="https://registry.npmjs.org/${pkgname}/-/${pkgname}-${version}.tgz"
-sha256="52a980dbfc61a5a1b6083688232d6a28b223a6d87c500213f3c6702fe898753d"
-resource "upstream" \
-  "https://github.com/voidzero-dev/${pkgname}/archive/refs/tags/v${version}.tar.gz" \
-  "c1d15c0b059753878b47816329f275274dbf42f958a071e4ada79fa0f54c4152"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
-packages=(
-  "vite-plus-${version}"
-)
-vite_task_rev="a3c087a771a116f7c60220fc72738703eb45ac2e"
-binding="binding/${pkgname}.openharmony-arm64.node"
-rust_channel="nightly-2026-08-02"
-rust_toolchain="${rust_channel}-aarch64-unknown-linux-ohos"
-pnpm_version="10"
-work_dir="$NPMBUILD_DIR"
-stage_dir="${work_dir}/build"
-output_dir="${work_dir}/${pkgname}-${version}"
-vite_task_dir="${stage_dir}/vite-task"
+const version = '1.4.0';
+const viteTaskRev = 'a3c087a771a116f7c60220fc72738703eb45ac2e';
+const binding = 'binding/vite-plus.openharmony-arm64.node';
+const rustChannel = 'nightly-2026-08-02';
+const rustToolchain = `${rustChannel}-aarch64-unknown-linux-ohos`;
+const rootDir = import.meta.dirname;
+const stageDir = join(rootDir, 'build');
+const outputDir = join(rootDir, `vite-plus-${version}`);
+const viteTaskDir = join(stageDir, 'vite-task');
 
-prepare() {
-  echo "=== deps: brew rustup/cmake/openssl@3/zlib, npm pnpm ==="
-
-  brew install -y rustup cmake openssl@3 zlib
-  npm install -g "pnpm@${pnpm_version}"
-
-  echo "=== fetch: 官方 tgz + v${version} 源树 + vite-task ==="
-  rm -rf "${stage_dir}"
-  mkdir -p "${stage_dir}"
-  cd "${stage_dir}"
-
-  fetch_source tgz.tgz
-  tar -zxf tgz.tgz
-  rm tgz.tgz
-  mv package tgz
-
-  fetch_resource "upstream" src.tar.gz
-  tar -zxf src.tar.gz
-  rm src.tar.gz
-  mv "${pkgname}-${version}" src
-
-  if [ ! -d "${vite_task_dir}/.git" ]; then
-    git clone -q https://github.com/voidzero-dev/vite-task.git "${vite_task_dir}"
-    git -C "${vite_task_dir}" fetch -q --depth 1 origin "${vite_task_rev}"
-    git -C "${vite_task_dir}" checkout -q "${vite_task_rev}"
-  fi
-}
-
-build() {
-  echo "=== build: 源树打 patch + vite-task 闸门 + 交叉编译 binding ==="
-
-  cd "${stage_dir}/src"
-  patch -p1 <"${work_dir}/patches/0002-remove-package-manager-pin.patch"
-  if grep -q '"packageManager"' package.json; then
-    echo "ERROR: 0002 did not remove packageManager" >&2
-    exit 1
-  fi
-  patch -p1 <"${work_dir}/patches/0003-enable-local-vite-task-patch-section.patch"
-  if ! grep -q '^\[patch\."https://github.com/voidzero-dev/vite-task.git"\]$' Cargo.toml; then
-    echo "ERROR: 0003 did not enable the vite-task [patch] section" >&2
-    exit 1
-  fi
-  if grep -q '^vt = { path = ' Cargo.toml; then
-    echo "ERROR: 0003 must not patch vt onto a path" >&2
-    exit 1
-  fi
-
-  export NPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS=false
-  export npm_config_manage_package_manager_versions=false
-
-  export RUSTUP_HOME="${stage_dir}/rustup-home"
-  export CARGO_HOME="${stage_dir}/cargo-home"
-  rustup toolchain install "${rust_toolchain}" --profile minimal --component rust-src
-  export RUSTUP_TOOLCHAIN="${rust_toolchain}"
-  export PATH="${RUSTUP_HOME}/toolchains/${rust_toolchain}/bin:${PATH}"
-
-  export RUSTC_BOOTSTRAP=1
-
-  if [ -z "${OHOS_SDK_NATIVE:-}" ]; then
-    sdk="$(brew --prefix)/opt/ohos-sdk"
-    [ -d "${sdk}/native" ] && OHOS_SDK_NATIVE="${sdk}/native" && export OHOS_SDK_NATIVE
-  fi
-  if [ -z "${OHOS_SDK_NATIVE:-}" ]; then
-    echo "ERROR: OHOS_SDK_NATIVE not set" >&2
-    exit 1
-  fi
-
-  if ! curl -fsIL --max-time 8 -o /dev/null "https://index.crates.io/config.json" 2>/dev/null; then
-    export CARGO_REGISTRIES_CRATES_IO_INDEX="sparse+https://rsproxy.cn/index/"
-  fi
-
-  cd "${vite_task_dir}"
-  patch -p1 <"${work_dir}/patches/0004-fspy-ohos-exemption.patch"
-  if [ "$(grep -c 'not(target_env = "ohos")' crates/fspy_preload_unix/src/lib.rs)" -ne 4 ]; then
-    echo "ERROR: 0004 did not add the ohos exemption" >&2
-    exit 1
-  fi
-  cd "${stage_dir}/src"
-
-  patch -p1 <"${work_dir}/patches/0005-add-ohos-port-overrides.patch"
-  if ! grep -q -- "- '@ohos-npm-ports/\*'" pnpm-workspace.yaml; then
-    echo "ERROR: 0005 did not add the port scope to minimumReleaseAgeExclude" >&2
-    exit 1
-  fi
-
-  node packages/tools/src/index.ts sync-remote
-  patch -p1 <"${work_dir}/patches/0007-declare-vite-typescript.patch"
-
-  pnpm install --no-frozen-lockfile
-  node "${work_dir}/verify-build-deps.cjs"
-  pnpm build
-
-  test -f "packages/cli/${binding}" || {
-    echo "ERROR: packages/cli/${binding} not built" >&2
-    exit 1
-  }
-  cargo metadata --format-version 1 --filter-platform aarch64-unknown-linux-ohos >"${stage_dir}/cargo-metadata.json"
-  node - "${stage_dir}/cargo-metadata.json" "${vite_task_dir}" <<'NODE'
-const assert = require("node:assert/strict");
-const { resolve } = require("node:path");
-const metadata = require(process.argv[2]);
-const preload = metadata.packages.filter(p => p.name === "fspy_preload_unix");
-assert.equal(preload.length, 1);
-assert.equal(preload[0].manifest_path, resolve(process.argv[3], "crates/fspy_preload_unix/Cargo.toml"));
-for (const name of ["fspy", "vt", "vt_path", "vt_str", "vt_workspace"]) {
-  const packages = metadata.packages.filter(p => p.name === name);
-  assert.ok(packages.length, name);
-  assert.ok(packages.some(p => p.source?.startsWith("git+https://github.com/voidzero-dev/vite-task.git")), name);
-}
-const byId = new Map(metadata.packages.map(p => [p.id, p]));
-for (const node of metadata.resolve.nodes) {
-  const owner = byId.get(node.id);
-  if (!owner.manifest_path.startsWith(process.cwd() + "/crates/")) continue;
-  for (const dependency of node.deps) {
-    const pkg = byId.get(dependency.pkg);
-    if (!["fspy", "vt", "vt_path", "vt_str", "vt_workspace"].includes(pkg.name)) continue;
-    assert.ok(pkg.source?.startsWith("git+https://github.com/voidzero-dev/vite-task.git"), pkg.name);
+function verifyCoreResolution(root, mode = '') {
+  const source = readFileSync(resolve(root, 'dist/bin.js'), 'utf8');
+  const start = source.indexOf('function resolveCore(');
+  assert.notEqual(start, -1);
+  const implementation = source.slice(start, source.indexOf('\n}', start) + 2);
+  for (const platform of ['openharmony', 'linux', 'darwin', 'win32']) {
+    for (const [name, manifestVersion, expected] of [
+      ['@ohos-npm-ports/vite-plus', '1.4.0-2', '1.4.0'],
+      ['@ohos-npm-ports/vite-plus', '1.4.0-beta.1-2', '1.4.0-beta.1'],
+      ['vite-plus', '1.4.0', '1.4.0'],
+      ['vite-plus', '1.4.0-beta.1', '1.4.0-beta.1'],
+    ]) {
+      if (mode === 'baseline' && name.startsWith('@ohos-npm-ports/')) continue;
+      const checks = [];
+      const fn = runInNewContext(`(${implementation.replace('import.meta.url', '"cli"')})`, {
+        process: { platform, cwd: () => '/project' },
+        createRequire: () => ({ resolve: value => value }),
+        readFileSync: () => JSON.stringify({ name, version: manifestVersion }),
+        checkCoreVersion: (_, value) => checks.push(value),
+        checkProjectCoreVersion: (_, __, value) => checks.push(value),
+      });
+      assert.equal(fn('/pack'), 'vite/pack');
+      assert.deepEqual(checks, [expected, expected], platform);
+    }
   }
 }
-console.log("OK: only preload is patched; consuming vite-task crates remain on git");
-NODE
+
+function verifyCargoMetadata(file) {
+  const metadata = readJson(file);
+  const preload = metadata.packages.filter(pkg => pkg.name === 'fspy_preload_unix');
+  assert.equal(preload.length, 1);
+  assert.equal(preload[0].manifest_path, resolve(viteTaskDir, 'crates/fspy_preload_unix/Cargo.toml'));
+  for (const name of ['fspy', 'vt', 'vt_path', 'vt_str', 'vt_workspace']) {
+    const packages = metadata.packages.filter(pkg => pkg.name === name);
+    assert.ok(packages.length, name);
+    assert.ok(packages.some(pkg => pkg.source?.startsWith('git+https://github.com/voidzero-dev/vite-task.git')), name);
+  }
+  const byId = new Map(metadata.packages.map(pkg => [pkg.id, pkg]));
+  for (const node of metadata.resolve.nodes) {
+    const owner = byId.get(node.id);
+    if (!owner.manifest_path.startsWith(`${process.cwd()}/crates/`)) continue;
+    for (const dependency of node.deps) {
+      const pkg = byId.get(dependency.pkg);
+      if (!['fspy', 'vt', 'vt_path', 'vt_str', 'vt_workspace'].includes(pkg.name)) continue;
+      assert.ok(pkg.source?.startsWith('git+https://github.com/voidzero-dev/vite-task.git'), pkg.name);
+    }
+  }
 }
 
-package() {
-  echo "=== package: 重打包官方 tgz + 嵌入 binding + manifest 断言 ==="
+export default class VitePlus extends Port {
+  static pkgname = 'vite-plus';
+  static upstream = 'vite-plus';
+  static version = version;
+  static revision = 4;
+  static distTag = 'latest';
+  static source = `https://registry.npmjs.org/vite-plus/-/vite-plus-${version}.tgz`;
+  static sha256 = '52a980dbfc61a5a1b6083688232d6a28b223a6d87c500213f3c6702fe898753d';
+  static resources = [
+    resource(
+      'upstream',
+      `https://github.com/voidzero-dev/vite-plus/archive/refs/tags/v${version}.tar.gz`,
+      'c1d15c0b059753878b47816329f275274dbf42f958a071e4ada79fa0f54c4152',
+    ),
+  ];
+  static packages = [`vite-plus-${version}`];
 
-  rm -rf "${output_dir}"
-  cp -a "${stage_dir}/tgz" "${output_dir}"
-  cd "${output_dir}"
-  patch -p1 <"${work_dir}/patches/0006-fix-core-version.patch"
-  node "${work_dir}/test.js" "${output_dir}"
+  prepare() {
+    run('brew', ['install', '-y', 'rustup', 'cmake', 'openssl@3', 'zlib']);
+    run('npm', ['install', '-g', 'pnpm@10']);
+    rmSync(stageDir, { recursive: true, force: true });
+    mkdirSync(stageDir, { recursive: true });
+    cd(stageDir);
+    fetchSource(join(stageDir, 'tgz.tgz'));
+    run('tar', ['-zxf', join(stageDir, 'tgz.tgz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'tgz.tgz'), { force: true });
+    renameSync(join(stageDir, 'package'), join(stageDir, 'tgz'));
+    fetchResource('upstream', join(stageDir, 'src.tar.gz'));
+    run('tar', ['-zxf', join(stageDir, 'src.tar.gz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'src.tar.gz'), { force: true });
+    renameSync(join(stageDir, `vite-plus-${version}`), join(stageDir, 'src'));
+    if (!existsSync(join(viteTaskDir, '.git'))) {
+      run('git', ['clone', '-q', 'https://github.com/voidzero-dev/vite-task.git', viteTaskDir]);
+      run('git', ['-C', viteTaskDir, 'fetch', '-q', '--depth', '1', 'origin', viteTaskRev]);
+      run('git', ['-C', viteTaskDir, 'checkout', '-q', viteTaskRev]);
+    }
+  }
 
-  cp "${stage_dir}/src/packages/cli/${binding}" "${binding}"
+  build() {
+    const sourceDir = join(stageDir, 'src');
+    cd(sourceDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0002-remove-package-manager-pin.patch')) });
+    assert.ok(!readJson(join(sourceDir, 'package.json')).packageManager);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0003-enable-local-vite-task-patch-section.patch')) });
+    const cargoManifest = readFileSync(join(sourceDir, 'Cargo.toml'), 'utf8');
+    assert.ok(/^\[patch\."https:\/\/github\.com\/voidzero-dev\/vite-task\.git"\]$/m.test(cargoManifest));
+    assert.ok(!/^vt = \{ path = /m.test(cargoManifest));
+    process.env.NPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS = 'false';
+    process.env.npm_config_manage_package_manager_versions = 'false';
+    process.env.RUSTUP_HOME = join(stageDir, 'rustup-home');
+    process.env.CARGO_HOME = join(stageDir, 'cargo-home');
+    run('rustup', ['toolchain', 'install', rustToolchain, '--profile', 'minimal', '--component', 'rust-src']);
+    process.env.RUSTUP_TOOLCHAIN = rustToolchain;
+    process.env.PATH = `${join(process.env.RUSTUP_HOME, 'toolchains', rustToolchain, 'bin')}:${process.env.PATH}`;
+    process.env.RUSTC_BOOTSTRAP = '1';
+    if (!process.env.OHOS_SDK_NATIVE) {
+      const brewPrefix = run('brew', ['--prefix'], { capture: true }).stdout.trim();
+      const sdk = join(brewPrefix, 'opt/ohos-sdk/native');
+      if (existsSync(sdk)) process.env.OHOS_SDK_NATIVE = sdk;
+    }
+    assert.ok(process.env.OHOS_SDK_NATIVE, 'OHOS_SDK_NATIVE not set');
+    try {
+      run('curl', ['-fsIL', '--max-time', '8', '-o', '/dev/null', 'https://index.crates.io/config.json'], { capture: true });
+    } catch {
+      process.env.CARGO_REGISTRIES_CRATES_IO_INDEX = 'sparse+https://rsproxy.cn/index/';
+    }
+    cd(viteTaskDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0004-fspy-ohos-exemption.patch')) });
+    const preload = readFileSync(join(viteTaskDir, 'crates/fspy_preload_unix/src/lib.rs'), 'utf8');
+    assert.equal(preload.match(/not\(target_env = "ohos"\)/g)?.length, 4);
+    cd(sourceDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0005-add-ohos-port-overrides.patch')) });
+    assert.ok(readFileSync(join(sourceDir, 'pnpm-workspace.yaml'), 'utf8').includes("- '@ohos-npm-ports/*'"));
+    run('node', ['packages/tools/src/index.ts', 'sync-remote']);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0007-declare-vite-typescript.patch')) });
+    run('pnpm', ['install', '--no-frozen-lockfile']);
+    run(process.execPath, [join(rootDir, 'verify-build-deps.cjs')]);
+    run('pnpm', ['build']);
+    assert.ok(statSync(join(sourceDir, 'packages/cli', binding)).size > 0);
+    const metadataFile = join(stageDir, 'cargo-metadata.json');
+    const metadata = run('cargo', ['metadata', '--format-version', '1', '--filter-platform', 'aarch64-unknown-linux-ohos'], {
+      capture: true,
+      maxBuffer: 100 * 1024 * 1024,
+    });
+    writeFileSync(metadataFile, metadata.stdout);
+    verifyCargoMetadata(metadataFile);
+  }
 
-  node -e '
-      const p = require("./package.json");
-      if (p.version !== process.argv[1]) { console.error("bad version: " + p.version); process.exit(1); }
-      console.log("OK: manifest");
-    ' "${version}"
-}
+  package() {
+    rmSync(outputDir, { recursive: true, force: true });
+    cpSync(join(stageDir, 'tgz'), outputDir, { recursive: true });
+    cd(outputDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0006-fix-core-version.patch')) });
+    verifyCoreResolution(outputDir);
+    copyFileSync(join(stageDir, 'src/packages/cli', binding), join(outputDir, binding));
+    assert.equal(readJson(join(outputDir, 'package.json')).version, version);
+    const loader = readFileSync(join(outputDir, 'binding/index.cjs'), 'utf8');
+    assert.ok(loader.includes("process.platform === 'openharmony'"));
+    assert.ok(loader.includes("require('./vite-plus.openharmony-arm64.node')"));
+    rmSync(stageDir, { recursive: true, force: true });
+    assert.ok(existsSync(outputDir));
+  }
 
-check() {
-  echo "=== test: loader 接线断言 ==="
-  cd "${output_dir}"
+  static testTimeout = 600_000;
 
-  grep -q "process.platform === 'openharmony'" binding/index.cjs
-  grep -q "require('./${pkgname}.openharmony-arm64.node')" binding/index.cjs
-
-  cd "${work_dir}"
-  rm -rf "${stage_dir}"
-  test -d "${output_dir}"
-
-  echo "OK: @ohos-npm-ports/${pkgname} ${version} built and verified"
+  test() {
+    const context = recipeContext();
+    const pkg = requirePackage('vite-plus/package.json');
+    if (context.mode !== 'baseline') {
+      assert.equal(pkg.name, '@ohos-npm-ports/vite-plus');
+      assert.equal(pkg.version, context.portVersion);
+    }
+    const root = dirname(context.resolvePackage('vite-plus/package.json'));
+    const native = requirePackage(resolve(root, 'binding/index.cjs'));
+    assert.equal(typeof native.run, 'function');
+    assert.equal(typeof native.runCommand, 'function');
+    const output = run(process.execPath, [resolve(root, 'bin/vp'), '--version'], { capture: true, timeout: 30_000 });
+    assert.match(output.stdout + output.stderr, /1\.4\.0/);
+    verifyCoreResolution(root, context.mode);
+    return { result: { coreResolution: true }, assets: [] };
+  }
 }

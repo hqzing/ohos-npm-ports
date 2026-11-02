@@ -21,7 +21,20 @@ function fixture(t) {
   const dir = join(root, 'ports', 'd', 'demo');
   mkdirSync(join(dir, 'main'), { recursive: true });
   mkdirSync(join(dir, 'slot'), { recursive: true });
-  writeFileSync(join(dir, 'NPMBUILD'), `pkgname="demo"\nupstream="demo"\nversion="1.2.3"\nrevision=4\ndist_tag="latest"\npackages=("@ohos-npm-ports/demo-openharmony-arm64:slot" "main")\nbuild() { :; }\n`);
+  symlinkSync(join(process.cwd(), 'cli'), join(root, 'cli'), 'dir');
+  writeFileSync(join(dir, 'NPMBUILD'), `#!/usr/bin/env node
+import { Port } from '../../../cli/recipe.mjs';
+const version = '1.2.3';
+export default class Demo extends Port {
+  static pkgname = 'demo';
+  static upstream = 'demo';
+  static version = version;
+  static revision = 4;
+  static distTag = 'latest';
+  static packages = ['@ohos-npm-ports/demo-openharmony-arm64:slot', 'main'];
+  build() {}
+}
+`);
   writeFileSync(join(dir, 'main', 'package.json'), JSON.stringify({
     name: 'demo', version: '1.2.3',
     optionalDependencies: { '@upstream/slot': 'npm:@ohos-npm-ports/demo-openharmony-arm64@1.2.3' },
@@ -70,6 +83,7 @@ test('edit opens the selected NPMBUILD with vim or the configured editor', (t) =
 
 test('create derives scoped names and fetches version and source checksum', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'npm-ports-create-'));
+  symlinkSync(join(process.cwd(), 'cli'), join(root, 'cli'), 'dir');
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const source = 'https://registry.npmjs.org/@scope/demo/-/demo-1.2.3.tgz';
   const execute = (command, args) => {
@@ -80,9 +94,9 @@ test('create derives scoped names and fetches version and source checksum', asyn
   assert.equal(port.pkgname, 'scope-demo');
   assert.equal(port.relative, 'ports/s/scope-demo/NPMBUILD');
   const text = readFileSync(port.file, 'utf8');
-  assert.match(text, /upstream="@scope\/demo"/);
-  assert.match(text, /version="1.2.3"/);
-  assert.match(text, new RegExp(`sha256="${'a'.repeat(64)}"`));
+  assert.match(text, /static upstream = '@scope\/demo';/);
+  assert.match(text, /const version = '1.2.3';/);
+  assert.match(text, new RegExp(`static sha256 = '${'a'.repeat(64)}';`));
   assert.doesNotThrow(() => loadPort(root, port.dir));
   await assert.rejects(createPort(root, '@scope/demo', { execute, download: async () => 'a'.repeat(64) }), /port already exists/);
 });
@@ -97,17 +111,17 @@ test('create supports no-fetch and opens the generated NPMBUILD', (t) => {
   const output = execFileSync('cli/npm-ports', ['create', '@scope/demo', '--set-name=custom-demo', '--set-version=1.2.3', '--no-fetch'], { env, encoding: 'utf8' });
   const file = join(root, 'ports/c/custom-demo/NPMBUILD');
   const text = readFileSync(file, 'utf8');
-  assert.match(text, /pkgname="custom-demo"/);
-  assert.match(text, /version="1.2.3"/);
-  assert.match(text, /sha256=""/);
+  assert.match(text, /static pkgname = 'custom-demo';/);
+  assert.match(text, /const version = '1.2.3';/);
+  assert.match(text, /static sha256 = '';/);
   assert.match(text, /demo-\$\{version\}\.tgz/);
-  assert.match(text, /fetch_source build\/upstream\.tgz/);
+  assert.match(text, /fetchSource\('build\/upstream\.tgz'\)/);
   assert.doesNotMatch(text, /curl|sha256sum/);
   assert.match(output, /Fill in version and sha256/);
   assert.equal(readFileSync(log, 'utf8').trim(), file);
 });
 
-test('loadPort reads Bash metadata and rejects latest on a versioned port', (t) => {
+test('loadPort reads class metadata and rejects latest on a versioned port', (t) => {
   const { root, dir } = fixture(t);
   const port = loadPort(root, dir);
   assert.equal(port.portVersion, '1.2.3-4');
@@ -115,7 +129,19 @@ test('loadPort reads Bash metadata and rejects latest on a versioned port', (t) 
   assert.deepEqual(port.packageNames, ['@ohos-npm-ports/demo-openharmony-arm64', '']);
   const versioned = join(root, 'ports', 'd', 'demo@1.2');
   mkdirSync(versioned);
-  writeFileSync(join(versioned, 'NPMBUILD'), 'pkgname="demo"\nupstream="demo"\nversion="1.2.3"\nrevision=1\ndist_tag="latest"\npackages=("main")\nbuild() { :; }\n');
+  writeFileSync(join(versioned, 'NPMBUILD'), `#!/usr/bin/env node
+import { Port } from '../../../cli/recipe.mjs';
+const version = '1.2.3';
+export default class Demo extends Port {
+  static pkgname = 'demo';
+  static upstream = 'demo';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = ['main'];
+  build() {}
+}
+`);
   assert.throws(() => loadPort(root, versioned), /must not publish to latest/);
 });
 
@@ -151,15 +177,19 @@ test('normalization injects final manifests and is idempotent', (t) => {
 test('lifecycle automatically runs prerequisites and isolates slot hooks', (t) => {
   const { root, dir } = fixture(t);
   const file = join(dir, 'NPMBUILD');
-  const hooks = (prefix) => ['prepare', 'build', 'package', 'check'].map((phase) => {
-    const environment = !prefix && phase === 'build' ? 'export NPM_PORTS_TEST_ENV=ready; '
-      : phase === 'check' ? (prefix ? 'test -z "${NPM_PORTS_TEST_ENV:-}"; ' : 'test "$NPM_PORTS_TEST_ENV" = ready; ') : '';
-    return `${prefix}${phase}() { ${environment}test "$PWD" = "$NPMBUILD_SLOT_DIR"; printf '%s\\n' '${prefix}${phase}' >> "$NPMBUILD_DIR/lifecycle.log"; }`;
+  const hooks = (prefix) => ['prepare', 'build', 'package'].map((phase) => {
+    const environment = !prefix && phase === 'build' ? 'process.env.NPM_PORTS_TEST_ENV = "ready"; '
+      : phase === 'package' ? (prefix ? 'if (process.env.NPM_PORTS_TEST_ENV) throw new Error("slot leaked env"); ' : 'if (process.env.NPM_PORTS_TEST_ENV !== "ready") throw new Error("missing env"); ') : '';
+    return `${prefix}${phase}() { ${environment}if (process.cwd() !== recipeContext().slotDir) throw new Error("wrong cwd"); appendFileSync(join(recipeContext().dir, 'lifecycle.log'), '${prefix}${phase}\\n'); }`;
   }).join('\n');
-  writeFileSync(file, `${readFileSync(file, 'utf8').replace('@ohos-npm-ports/demo-openharmony-arm64:slot', '@ohos-npm-ports/demo-openharmony-arm64:slots/demo')}\n${hooks('')}\n${hooks('slot_demo_')}\n`);
+  const imports = "import { appendFileSync } from 'node:fs';\nimport { join } from 'node:path';\nimport { recipeContext } from '../../../cli/recipe.mjs';\n";
+  const source = readFileSync(file, 'utf8')
+    .replace('@ohos-npm-ports/demo-openharmony-arm64:slot', '@ohos-npm-ports/demo-openharmony-arm64:slots/demo')
+    .replace(/\n\}\n$/, `\n${hooks('')}\n${hooks('slot_demo_')}\n}\n`);
+  writeFileSync(file, source.replace('#!/usr/bin/env node\n', `#!/usr/bin/env node\n${imports}`));
   mkdirSync(join(dir, 'slots', 'demo'), { recursive: true });
   writeFileSync(join(dir, 'slots', 'demo', 'package.json'), JSON.stringify({ version: '1.2.3' }));
-  runLifecycle(loadPort(root, dir), 'check');
+  runLifecycle(loadPort(root, dir), 'package');
   const main = JSON.parse(readFileSync(join(dir, 'main', 'package.json')));
   assert.equal(main.name, '@ohos-npm-ports/demo');
   assert.equal(main.version, '1.2.3-4');
@@ -167,15 +197,16 @@ test('lifecycle automatically runs prerequisites and isolates slot hooks', (t) =
   assert.equal(JSON.parse(readFileSync(join(dir, 'slots', 'demo', 'package.json'))).name, '@ohos-npm-ports/demo-openharmony-arm64');
   assert.equal(JSON.parse(readFileSync(join(dir, 'slots', 'demo', 'package.json'))).version, '1.2.3-4');
   assert.deepEqual(readFileSync(join(dir, 'lifecycle.log'), 'utf8').trim().split('\n'), [
-    'prepare', 'build', 'package', 'check',
-    'slot_demo_prepare', 'slot_demo_build', 'slot_demo_package', 'slot_demo_check',
+    'prepare', 'build', 'package',
+    'slot_demo_prepare', 'slot_demo_build', 'slot_demo_package',
   ]);
 });
 
 test('lifecycle preserves early-exit pipeline behavior', (t) => {
   const { root, dir } = fixture(t);
   const file = join(dir, 'NPMBUILD');
-  writeFileSync(file, readFileSync(file, 'utf8').replace('build() { :; }', 'build() { yes | head -n 1 >/dev/null; }'));
+  const source = readFileSync(file, 'utf8').replace('build() {}', "build() { shell('yes | head -n 1 >/dev/null', { allowExitCodes: [0, 141] }); }");
+  writeFileSync(file, source.replace('#!/usr/bin/env node\n', "#!/usr/bin/env node\nimport { shell } from '../../../cli/recipe.mjs';\n"));
   assert.doesNotThrow(() => runLifecycle(loadPort(root, dir), 'build'));
 });
 
@@ -184,14 +215,14 @@ test('lint enforces version metadata and unique declarations', (t) => {
   const port = loadPort(root, dir);
   const file = join(dir, 'NPMBUILD');
   const source = readFileSync(file, 'utf8');
-  writeFileSync(file, `${source}VERSION=1.2.3\n`);
-  assert.throws(() => lintPort(port), /version literals must reference the version metadata/);
-  writeFileSync(file, `${source}VERSION="\${version}"\n`);
-  assert.throws(() => lintPort(port), /legacy metadata alias VERSION/);
-  writeFileSync(file, `foo=1\nfoo=2\n${source}`);
-  assert.throws(() => lintPort(port), /duplicate global assignment foo/);
-  writeFileSync(file, `${source}version="\${version}"\n`);
-  assert.throws(() => lintPort(port), /metadata alias version is redundant/);
+  writeFileSync(file, source.replace("const version = '1.2.3';", "const other = '1.2.3';"));
+  assert.throws(() => lintPort(port), /top-level literal const/);
+  writeFileSync(file, source.replace('static version = version;', 'static version = other;'));
+  assert.throws(() => lintPort(port), /must reference the shared const/);
+  writeFileSync(file, `const foo = 1;\nconst foo = 2;\n${source}`);
+  assert.throws(() => lintPort(port), /Command failed/);
+  writeFileSync(file, source.replace('static revision = 4;', 'static revision = 4;\n  static revision = 5;'));
+  assert.throws(() => lintPort(port), /duplicate declaration static revision/);
   const hash = 'a'.repeat(64);
   writeFileSync(file, `${source}${hash}\n${hash}\n`);
   assert.throws(() => lintPort(port), /duplicate SHA-256 literal/);
@@ -204,7 +235,7 @@ test('lint separates current port revisions from cross-port dependency pins', (t
   const patches = join(dir, 'patches');
   const patch = join(patches, '0001-test.patch');
   mkdirSync(patches);
-  writeFileSync(file, `${readFileSync(file, 'utf8')}# 0001-test.patch\n`);
+  writeFileSync(file, `${readFileSync(file, 'utf8')}// 0001-test.patch\n`);
   writeFileSync(patch, '--- a/package.json\n+++ b/package.json\n@@ -1 +1 @@\n-  "version": "1.2.3"\n+  "version": "1.2.3-4"\n');
   assert.throws(() => lintPort(port), /must not change package\.json version/);
   writeFileSync(patch, '--- a/package.json\n+++ b/package.json\n@@ -1,2 +1,2 @@\n {\n   "version": "1.2.3"\n');
@@ -223,8 +254,8 @@ test('lint separates current port revisions from cross-port dependency pins', (t
   assert.doesNotThrow(() => lintPort(port));
   writeFileSync(patch, '--- a/package.json\n+++ b/package.json\n@@ -1 +1 @@\n-  "slot": "1.2.3"\n+  "slot": "npm:@ohos-npm-ports/demo-openharmony-arm64@1.2.3-7"\n');
   assert.throws(() => lintPort(port), /current port revisions/);
-  writeFileSync(file, `${readFileSync(file, 'utf8')}port_version="\${version}-2"\n`);
-  assert.throws(() => lintPort(port), /use bare upstream version/);
+  writeFileSync(file, `${readFileSync(file, 'utf8')}  check();\n`);
+  assert.throws(() => lintPort(port), /check\(\) is obsolete/);
 });
 
 test('pack and dry-run publish use exact versioned artifacts', (t) => {
@@ -378,9 +409,9 @@ test('lint reserves signing and readelf checks for pack', (t) => {
   const { root, dir } = fixture(t);
   const port = loadPort(root, dir);
   const file = join(dir, 'NPMBUILD');
-  writeFileSync(file, `${readFileSync(file, 'utf8')}binary-sign-tool sign -selfSign 1\n`);
+  writeFileSync(file, `${readFileSync(file, 'utf8')}run('binary-sign-tool', ['sign', '-selfSign', '1']);\n`);
   assert.throws(() => lintPort(port), /signing and signature checks are managed by npm-ports pack/);
-  writeFileSync(file, `${readFileSync(file, 'utf8')}readelf -S binding.node | grep -q '\\.codesign'\n`);
+  writeFileSync(file, `${readFileSync(file, 'utf8')}run('readelf', ['-S', 'binding.node']);\n`);
   assert.throws(() => lintPort(port), /readelf checks are not needed in NPMBUILD/);
 });
 
@@ -396,19 +427,21 @@ test('bump updates only source and resource declarations', async (t) => {
   const { root, dir } = fixture(t);
   const portFile = join(dir, 'NPMBUILD');
   const declarations = [
-    'source="https://registry.npmjs.org/demo/-/demo-${version}.tgz"',
-    `sha256="${'a'.repeat(64)}"`,
-    'resource "source_archive" \\',
-    '  "https://github.com/example/demo/archive/v${version}.tar.gz" \\',
-    `  "${'b'.repeat(64)}"`,
-    'resource "pinned_tool" \\',
-    '  "https://example.com/tool-0.1.0.tar.gz" \\',
-    `  "${'c'.repeat(64)}"`,
+    '  static source = `https://registry.npmjs.org/demo/-/demo-${version}.tgz`;',
+    `  static sha256 = '${'a'.repeat(64)}';`,
+    '  static resources = [',
+    "    resource('source_archive', `https://github.com/example/demo/archive/v${version}.tar.gz`,",
+    `      '${'b'.repeat(64)}'),`,
+    "    resource('pinned_tool', 'https://example.com/tool-0.1.0.tar.gz',",
+    `      '${'c'.repeat(64)}'),`,
+    '  ];',
     '',
   ].join('\n');
-  writeFileSync(portFile, readFileSync(portFile, 'utf8')
-    .replace('"main"', '"demo-1.2.3"')
-    .replace('build() { :; }', `${declarations}\nbuild() { :; }\n# demo 1.2.3\necho 1.2.3`));
+  const source = readFileSync(portFile, 'utf8')
+    .replace("'main'", "'demo-1.2.3'")
+    .replace("  static distTag = 'latest';", `  static distTag = 'latest';\n${declarations}`)
+    .replace('build() {}', `build() {\n    // demo 1.2.3\n    console.log('1.2.3');\n  }`);
+  writeFileSync(portFile, source.replace('#!/usr/bin/env node\n', "#!/usr/bin/env node\nimport { resource } from '../../../cli/recipe.mjs';\n"));
   const patches = join(dir, 'patches');
   const patch = join(patches, '0001-test.patch');
   const patchText = '# cross-port dependency remains 1.2.3-7\n';
@@ -433,16 +466,16 @@ test('bump updates only source and resource declarations', async (t) => {
   assert.equal(changed[0].resources.length, 1);
   assert.match(readFileSync(output, 'utf8'), /version=1.3.0/);
   const text = readFileSync(portFile, 'utf8');
-  assert.match(text, /version="1.3.0"/);
-  assert.match(text, /revision=1/);
-  assert.match(text, new RegExp(`sha256="${'d'.repeat(64)}"`));
-  assert.match(text, new RegExp(`"${'e'.repeat(64)}"`));
-  assert.match(text, new RegExp(`"${'c'.repeat(64)}"`));
+  assert.match(text, /const version = '1.3.0';/);
+  assert.match(text, /static revision = 1;/);
+  assert.match(text, new RegExp(`static sha256 = '${'d'.repeat(64)}';`));
+  assert.match(text, new RegExp(`'${'e'.repeat(64)}'`));
+  assert.match(text, new RegExp(`'${'c'.repeat(64)}'`));
   assert.match(text, /demo-\$\{version\}\.tgz/);
   assert.match(text, /archive\/v\$\{version\}\.tar\.gz/);
   assert.doesNotMatch(text, /archive\/v1\.3\.0\.tar\.gz/);
-  assert.match(text, /"demo-1\.2\.3"/);
-  assert.match(text, /# demo 1\.2\.3\necho 1\.2\.3/);
+  assert.match(text, /'demo-1\.2\.3'/);
+  assert.match(text, /\/\/ demo 1\.2\.3/);
   assert.deepEqual(downloads.sort(), [
     'https://github.com/example/demo/archive/v1.3.0.tar.gz',
     'https://registry.npmjs.org/demo/-/demo-1.3.0.tgz',
@@ -451,7 +484,9 @@ test('bump updates only source and resource declarations', async (t) => {
 });
 
 test('port assignment updates preserve unrelated fields', () => {
-  assert.equal(updatePortText('version="1.0.0"\nrevision=4\ndist_tag="latest"\n', { version: '2.0.0', revision: '1' }), 'version="2.0.0"\nrevision=1\ndist_tag="latest"\n');
+  const source = "const version = '1.0.0';\nclass Demo {\n  static revision = 4;\n  static distTag = 'latest';\n}\n";
+  const expected = "const version = '2.0.0';\nclass Demo {\n  static revision = 1;\n  static distTag = 'latest';\n}\n";
+  assert.equal(updatePortText(source, { version: '2.0.0', revision: '1' }), expected);
 });
 
 test('bump-pr creates a versioned branch without force-pushing', async () => {
@@ -528,4 +563,40 @@ test('bump-pr does not create branches when the port is current', async () => {
   const result = await bumpPr('/repo', port, { execute, bump: async () => [] });
   assert.equal(result, null);
   assert.equal(commands.some((command) => command.includes('switch -c')), false);
+});
+
+
+test('recipe source partitions docs, build and trailing tests', async () => {
+  const { splitRecipe } = await import('../cli/recipe-source.mjs');
+  const source = `#!/usr/bin/env node\n/* maintainer docs */\nimport { Port } from '../../../cli/recipe.mjs';\nconst version = '1.2.3';\nexport default class Demo extends Port {\n  static version = version;\n  build() {}\n  static testTimeout = 600_000;\n  test() { return { result: { ok: true } }; }\n}\n`;
+  const { docsText, buildText, testText } = splitRecipe(source);
+  assert.match(docsText, /maintainer docs/);
+  assert.match(buildText, /build\(\)/);
+  assert.doesNotMatch(buildText, /maintainer docs|testTimeout|test\(\)/);
+  assert.match(testText, /testTimeout|test\(\)/);
+  const testEdit = source.replace('ok: true', 'ok: false');
+  assert.equal(splitRecipe(testEdit).buildText, buildText);
+  const docsEdit = source.replace('maintainer docs', 'updated docs');
+  assert.equal(splitRecipe(docsEdit).buildText, buildText);
+});
+
+test('sync and async command helpers return output and honor exit codes', async () => {
+  const { run, runAsync } = await import('../cli/recipe.mjs');
+  const sync = run(process.execPath, ['-e', 'process.stdout.write("sync")'], { capture: true });
+  assert.equal(sync.stdout, 'sync');
+  assert.throws(() => run(process.execPath, ['-e', 'process.exit(7)']), /exit code 7/);
+  assert.equal(run(process.execPath, ['-e', 'process.exit(7)'], { allowExitCodes: [7] }).code, 7);
+  const asyncResult = await runAsync(process.execPath, ['-e', 'process.stdout.write("async")'], { capture: true });
+  assert.equal(asyncResult.stdout, 'async');
+  await assert.rejects(runAsync(process.execPath, ['-e', 'process.exit(8)']), /exit code 8/);
+});
+
+test('bump updates a shared resource checksum constant', async () => {
+  const source = `const version = '1.2.3';\nconst toolSha256 = '${'a'.repeat(64)}';\nclass Demo {\n  static revision = 4;\n  static resources = [\n    resource('tool', \`https://example.com/\${version}.tgz\`, toolSha256),\n  ];\n}\n`;
+  const updated = updatePortText(source, {
+    version: '1.3.0', revision: '1', resources: [{ name: 'tool', sha256: 'b'.repeat(64) }],
+  });
+  assert.match(updated, /const toolSha256 = 'b{64}';/);
+  assert.match(updated, /static revision = 1;/);
+  assert.match(updated, /\$\{version\}/);
 });

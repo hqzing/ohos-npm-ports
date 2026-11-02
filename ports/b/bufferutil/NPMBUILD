@@ -1,43 +1,60 @@
-#!/usr/bin/env bash
-pkgname="bufferutil"
-upstream="bufferutil"
-version="4.1.0"
-revision=1
-dist_tag="latest"
+#!/usr/bin/env node
+import { Port, resource, run, cd, fetchSource, fetchResource } from '../../../cli/recipe.mjs';
+import { existsSync, readFileSync, renameSync, rmSync } from 'node:fs';
 
-packages=(
-  "bufferutil-${version}"
-)
-source="https://github.com/websockets/bufferutil/archive/refs/tags/v${version}.tar.gz"
-sha256="42971057cdc3acb64422aca071146d9d5bf73a42a142519d72db51896b0b0972"
-resource "npm" \
-  "https://registry.npmjs.org/bufferutil/-/bufferutil-${version}.tgz" \
-  "19af5978088739b8baf861a95ab4a1feb69a2d30830ced707c37920591046a87"
+const version = '4.1.0';
 
-build() {
-  # 准备源码
-  fetch_source bufferutil-${version}.tar.gz
-  tar -zxf bufferutil-${version}.tar.gz
-  cd bufferutil-${version}
-  patch -p1 <../patches/0001-update-package-json.patch
+export default class Bufferutil extends Port {
+  static pkgname = 'bufferutil';
+  static upstream = 'bufferutil';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [`bufferutil-${version}`];
+  static source = `https://github.com/websockets/bufferutil/archive/refs/tags/v${version}.tar.gz`;
+  static sha256 = '42971057cdc3acb64422aca071146d9d5bf73a42a142519d72db51896b0b0972';
+  static resources = [
+    resource(
+      'npm',
+      `https://registry.npmjs.org/bufferutil/-/bufferutil-${version}.tgz`,
+      '19af5978088739b8baf861a95ab4a1feb69a2d30830ced707c37920591046a87',
+    ),
+  ];
 
-  # 构建 addon
-  npm install
-  npm run prebuild
+  build() {
+    fetchSource(`bufferutil-${version}.tar.gz`);
+    run('tar', ['-zxf', `bufferutil-${version}.tar.gz`]);
 
-  # 把其他平台的预构建产物复制到包里面一起发布
-  cd ..
-  fetch_resource "npm" bufferutil-${version}.tgz
-  tar -zxf bufferutil-${version}.tgz
-  rm bufferutil-${version}.tgz
-  cp -r package/prebuilds/* bufferutil-${version}/prebuilds/
-  cd bufferutil-${version}/prebuilds
-  mv linux-x64/bufferutil.node linux-x64/@ohos-npm-ports+bufferutil.node
-  mv win32-ia32/bufferutil.node win32-ia32/@ohos-npm-ports+bufferutil.node
-  mv win32-x64/bufferutil.node win32-x64/@ohos-npm-ports+bufferutil.node
-  for platform in darwin-x64 darwin-arm64 darwin-x64+arm64; do
-    if [ -d "$platform" ]; then
-      mv "$platform/bufferutil.node" "$platform/@ohos-npm-ports+bufferutil.node"
-    fi
-  done
+    cd(`bufferutil-${version}`);
+    run('patch', ['-p1'], { input: readFileSync('../patches/0001-update-package-json.patch') });
+    run('npm', ['install']);
+    run('npm', ['run', 'prebuild']);
+
+    cd('..');
+    fetchResource('npm', `bufferutil-${version}.tgz`);
+    run('tar', ['-zxf', `bufferutil-${version}.tgz`]);
+    rmSync(`bufferutil-${version}.tgz`);
+    run('cp', ['-r', 'package/prebuilds/.', `bufferutil-${version}/prebuilds/`]);
+
+    renameSync(
+      `bufferutil-${version}/prebuilds/linux-x64/bufferutil.node`,
+      `bufferutil-${version}/prebuilds/linux-x64/@ohos-npm-ports+bufferutil.node`,
+    );
+    renameSync(
+      `bufferutil-${version}/prebuilds/win32-ia32/bufferutil.node`,
+      `bufferutil-${version}/prebuilds/win32-ia32/@ohos-npm-ports+bufferutil.node`,
+    );
+    renameSync(
+      `bufferutil-${version}/prebuilds/win32-x64/bufferutil.node`,
+      `bufferutil-${version}/prebuilds/win32-x64/@ohos-npm-ports+bufferutil.node`,
+    );
+    for (const platform of ['darwin-x64', 'darwin-arm64', 'darwin-x64+arm64']) {
+      if (existsSync(`bufferutil-${version}/prebuilds/${platform}`)) {
+        renameSync(
+          `bufferutil-${version}/prebuilds/${platform}/bufferutil.node`,
+          `bufferutil-${version}/prebuilds/${platform}/@ohos-npm-ports+bufferutil.node`,
+        );
+      }
+    }
+  }
 }

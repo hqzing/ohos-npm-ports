@@ -34,20 +34,38 @@ export async function downloadSha256(url) {
 }
 
 function assignment(source, key) {
-  const pattern = new RegExp(`^${key}=((?:\"[^\"]*\"|'[^']*'|[^\\s#]+))`, 'm');
-  const match = pattern.exec(source);
+  const patterns = {
+    version: /^const version = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+    revision: /^  static revision = (\d+);$/m,
+    source: /^  static source = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+    sha256: /^  static sha256 = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+  };
+  const match = patterns[key]?.exec(source);
   if (!match) throw new Error(`NPMBUILD is missing ${key}`);
   return match[1];
 }
 
 function replaceAssignment(source, key, value) {
-  const pattern = new RegExp(`^${key}=(?:\"[^\"]*\"|'[^']*'|[^\\s#]+)`, 'm');
-  if (!pattern.test(source)) throw new Error(`NPMBUILD is missing ${key}`);
-  return source.replace(pattern, key === 'revision' ? `${key}=${value}` : `${key}="${value}"`);
+  const patterns = {
+    version: /^const version = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+    revision: /^  static revision = \d+;$/m,
+    source: /^  static source = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+    sha256: /^  static sha256 = ("[^"]*"|'[^']*'|`[^`]*`);$/m,
+  };
+  const pattern = patterns[key];
+  if (!pattern?.test(source)) throw new Error(`NPMBUILD is missing ${key}`);
+  const replacement = key === 'revision'
+    ? `  static revision = ${value};`
+    : key === 'version'
+      ? `const version = '${value}';`
+      : `  static ${key} = '${value}';`;
+  return source.replace(pattern, replacement);
 }
 
 function tokenValue(token) {
-  if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) return token.slice(1, -1);
+  if ((token.startsWith('"') && token.endsWith('"'))
+    || (token.startsWith("'") && token.endsWith("'"))
+    || (token.startsWith('`') && token.endsWith('`'))) return token.slice(1, -1);
   return token;
 }
 
@@ -56,10 +74,17 @@ function hasVersionReference(value) {
 }
 
 export function resourceDeclarations(source) {
-  const declarations = [...source.matchAll(/^resource "([a-z][a-z0-9_]*)" \\\n  "([^"\n]+)" \\\n  "([a-f0-9]{64})"$/gm)]
-    .map((match) => ({ name: match[1], url: match[2], sha256: match[3], text: match[0] }));
-  const calls = source.match(/^resource\s/gm) ?? [];
-  if (declarations.length !== calls.length) throw new Error('resource declarations must use the canonical three-line form');
+  const constants = new Map([...source.matchAll(/^const ([A-Za-z_$][\w$]*) = '([a-f0-9]{64})';$/gm)]
+    .map((match) => [match[1], match[2]]));
+  const declarations = [...source.matchAll(/resource\(\s*'([a-z][a-z0-9_]*)',\s*([`"'])([^`]+?)\2,\s*(?:'([a-f0-9]{64})'|([A-Za-z_$][\w$]*))\s*,?\s*\)/gs)]
+    .map((match) => {
+      if (match[4] === undefined && !constants.has(match[5])) throw new Error(`Unknown resource SHA-256 constant: ${match[5]}`);
+      return {
+        name: match[1], url: match[3], sha256: match[4] ?? constants.get(match[5]), shaKey: match[5] ?? '', text: match[0],
+      };
+    });
+  const calls = source.match(/\bresource\s*\(/g) ?? [];
+  if (declarations.length !== calls.length) throw new Error('resource declarations must use the canonical resource(name, url, sha256) form');
   return declarations;
 }
 
@@ -76,8 +101,13 @@ export function updatePortText(source, values) {
     const declaration = resourceDeclarations(result).find(({ name }) => name === update.name);
     if (!declaration) throw new Error(`NPMBUILD is missing resource ${update.name}`);
     if (!hasVersionReference(declaration.url)) throw new Error(`resource ${update.name} does not reference version`);
-    const text = `resource "${update.name}" \\\n  "${declaration.url}" \\\n  "${update.sha256}"`;
-    result = result.replace(declaration.text, text);
+    if (declaration.shaKey) {
+      const pattern = new RegExp(`^const ${declaration.shaKey} = '[a-f0-9]{64}';$`, 'm');
+      result = result.replace(pattern, `const ${declaration.shaKey} = '${update.sha256}';`);
+    } else {
+      const text = declaration.text.replace(`'${declaration.sha256}'`, `'${update.sha256}'`);
+      result = result.replace(declaration.text, text);
+    }
   }
   return result;
 }

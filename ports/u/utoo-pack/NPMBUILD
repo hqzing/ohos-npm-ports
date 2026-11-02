@@ -1,76 +1,181 @@
-#!/usr/bin/env bash
-pkgname="utoo-pack"
-upstream="@utoo/pack"
-version="1.5.31"
-revision=3
-# npm 包与 utoo/next.js 固定 commit 需人工配套升级。
-bump=false
-source="https://registry.npmjs.org/@utoo/pack/-/pack-${version}.tgz"
-sha256="d7f1a2442bc65259f791dbb625c4a4a63a20bba39e2969ea9fa05a6b95559dcb"
-resource "utoo" \
-  "https://codeload.github.com/utooland/utoo/tar.gz/0e838fbfa1105d68dfdd2c1fc4f79fb1c1feebbd" \
-  "28f208e1280fc01aa05d8ec5663b7ced5a6907da44c7361cb5be6a818a7d9c64"
-resource "next" \
-  "https://codeload.github.com/utooland/next.js/tar.gz/815238d6a4a18958c43a6875a86026d20a424dac" \
-  "30c63a6c41d7a945f2121e8300c739e992c28dc246cfbde4d2fa913ba395d336"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, requirePackage, importPackage, recipeContext } from '../../../cli/recipe.mjs';
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 
-packages=(
-  "utoo-pack-${version}"
-)
+const version = '1.5.31';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const sourceDir = join(buildDir, 'source');
+const packageDir = join(rootDir, `utoo-pack-${version}`);
 
-root_dir="$NPMBUILD_DIR"
-build_dir="$root_dir/build"
-source_dir="$build_dir/source"
-package_dir="$root_dir/utoo-pack-${version}"
+export default class UtooPack extends Port {
+  static pkgname = 'utoo-pack';
+  static upstream = '@utoo/pack';
+  static version = version;
+  static revision = 3;
+  static distTag = 'latest';
+  static bump = false;
+  static source = `https://registry.npmjs.org/@utoo/pack/-/pack-${version}.tgz`;
+  static sha256 = 'd7f1a2442bc65259f791dbb625c4a4a63a20bba39e2969ea9fa05a6b95559dcb';
+  static resources = [
+    resource(
+      'utoo',
+      'https://codeload.github.com/utooland/utoo/tar.gz/0e838fbfa1105d68dfdd2c1fc4f79fb1c1feebbd',
+      '28f208e1280fc01aa05d8ec5663b7ced5a6907da44c7361cb5be6a818a7d9c64',
+    ),
+    resource(
+      'next',
+      'https://codeload.github.com/utooland/next.js/tar.gz/815238d6a4a18958c43a6875a86026d20a424dac',
+      '30c63a6c41d7a945f2121e8300c739e992c28dc246cfbde4d2fa913ba395d336',
+    ),
+  ];
+  static packages = [`utoo-pack-${version}`];
 
-prepare() {
-  brew install -y cmake pkgconf
-  [ "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-unknown-linux-ohos ]
+  prepare() {
+    run('brew', ['install', '-y', 'cmake', 'pkgconf']);
+    const host = run('rustc', ['-vV'], { capture: true }).stdout.match(/^host: (.+)$/m)?.[1];
+    assert.equal(host, 'aarch64-unknown-linux-ohos');
+    mkdirSync(buildDir, { recursive: true });
+    fetchResource('utoo', join(buildDir, 'source.tgz'));
+    fetchResource('next', join(buildDir, 'next.tgz'));
+    fetchSource(join(buildDir, 'package.tgz'));
+    rmSync(sourceDir, { recursive: true, force: true });
+    rmSync(packageDir, { recursive: true, force: true });
+    rmSync(join(buildDir, 'upstream'), { recursive: true, force: true });
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(packageDir, { recursive: true });
+    mkdirSync(join(buildDir, 'upstream'), { recursive: true });
+    run('tar', ['xzf', join(buildDir, 'source.tgz'), '-C', sourceDir, '--strip-components=1']);
+    run('tar', [
+      'xzf', join(buildDir, 'next.tgz'), '-C', join(sourceDir, 'next.js'), '--strip-components=1',
+      '--exclude=*/test', '--exclude=*/examples', '--exclude=*/.claude',
+    ]);
+    run('tar', ['xzf', join(buildDir, 'package.tgz'), '-C', join(buildDir, 'upstream'), '--strip-components=1']);
+    cpSync(join(buildDir, 'upstream'), packageDir, { recursive: true });
+  }
 
-  mkdir -p "$build_dir"
-  fetch_resource "utoo" "$build_dir/source.tgz"
-  fetch_resource "next" "$build_dir/next.tgz"
-  fetch_source "$build_dir/package.tgz"
-  rm -rf "$source_dir" "$package_dir" "$build_dir/upstream"
-  mkdir -p "$source_dir" "$package_dir" "$build_dir/upstream"
-  tar xzf "$build_dir/source.tgz" -C "$source_dir" --strip-components=1
-  tar xzf "$build_dir/next.tgz" -C "$source_dir/next.js" --strip-components=1 \
-    --exclude='*/test' --exclude='*/examples' --exclude='*/.claude'
-  tar xzf "$build_dir/package.tgz" -C "$build_dir/upstream" --strip-components=1
-  cp -R "$build_dir/upstream/." "$package_dir/"
-}
+  build() {
+    cd(sourceDir);
+    process.env.RUSTC_BOOTSTRAP = '1';
+    process.env.CARGO_TARGET_DIR = join(buildDir, 'target');
+    process.env.CARGO_PROFILE_RELEASE_LTO = 'false';
+    process.env.VERGEN_GIT_SHA = '0e838fbfa1105d68dfdd2c1fc4f79fb1c1feebbd';
+    process.env.VERGEN_GIT_DIRTY = 'false';
+    process.env.CC = 'cc';
+    process.env.CXX = 'c++';
+    run('cargo', ['build', '--locked', '--release', '-p', 'pack-napi', '--features', 'plugin', '-j', process.env.CARGO_BUILD_JOBS ?? '2']);
+  }
 
-build() {
-  cd "$source_dir"
-  export RUSTC_BOOTSTRAP=1
-  export CARGO_TARGET_DIR="$build_dir/target"
-  export CARGO_PROFILE_RELEASE_LTO=false
-  export VERGEN_GIT_SHA=0e838fbfa1105d68dfdd2c1fc4f79fb1c1feebbd
-  export VERGEN_GIT_DIRTY=false
-  export CC=cc CXX=c++
-  cargo build --locked --release -p pack-napi --features plugin -j "${CARGO_BUILD_JOBS:-2}"
-}
+  package() {
+    cd(packageDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-package-json.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0002-share-openharmony-binding.patch')) });
+    assert.ok(readFileSync(join(packageDir, 'esm/binding.js'), 'utf8').includes('../cjs/pack.openharmony-arm64.node'));
+    copyFileSync(join(sourceDir, 'LICENSE'), join(packageDir, 'LICENSE'));
+    copyFileSync(join(sourceDir, 'next.js/license.md'), join(packageDir, 'cjs/LICENSE-turbopack'));
+    copyFileSync(join(buildDir, 'target/release/libpack_napi.so'), join(packageDir, 'cjs/pack.openharmony-arm64.node'));
+    assert.deepEqual(readFileSync(join(packageDir, 'LICENSE')), readFileSync(join(sourceDir, 'LICENSE')));
+    assert.deepEqual(readFileSync(join(packageDir, 'cjs/LICENSE-turbopack')), readFileSync(join(sourceDir, 'next.js/license.md')));
+    assert.ok(readFileSync(join(packageDir, 'cjs/binding.js'), 'utf8').includes("process.platform === 'openharmony'"));
+    assert.ok(statSync(join(packageDir, 'cjs/pack.openharmony-arm64.node')).size > 0);
+    run(process.execPath, [join(rootDir, 'verify.cjs'), packageDir, join(buildDir, 'upstream')]);
+  }
 
-package() {
-  cd "$package_dir"
-  patch -p1 <"$root_dir/patches/0001-package-json.patch"
-  patch -p1 <"$root_dir/patches/0002-share-openharmony-binding.patch"
-  grep -q '../cjs/pack.openharmony-arm64.node' esm/binding.js
-  cp "$source_dir/LICENSE" LICENSE
-  cp "$source_dir/next.js/license.md" cjs/LICENSE-turbopack
-  cp "$build_dir/target/release/libpack_napi.so" cjs/pack.openharmony-arm64.node
-}
+  static testPrerequisites = ['ports/d/domparser-rs'];
+  static testTimeout = 600_000;
 
-check() {
-  cmp "$source_dir/LICENSE" "$package_dir/LICENSE"
-  cmp "$source_dir/next.js/license.md" "$package_dir/cjs/LICENSE-turbopack"
-  grep -q "process.platform === 'openharmony'" "$package_dir/cjs/binding.js"
-  node "$root_dir/verify.cjs" "$package_dir" "$build_dir/upstream"
-  cd "$package_dir"
-  package_version=$(node -p "require('./package.json').version")
-  npm pack --ignore-scripts --pack-destination "$build_dir"
-  mkdir -p "$build_dir/packed"
-  tar xzf "$build_dir/ohos-npm-ports-utoo-pack-${package_version}.tgz" -C "$build_dir/packed"
-  test -s "$build_dir/packed/package/cjs/pack.openharmony-arm64.node"
+  async test() {
+    const context = recipeContext();
+    const moduleMode = process.env.UTOO_TEST_MODULE;
+    if (!moduleMode) {
+      const reports = mkdtempSync(join(tmpdir(), 'utoo-pack-test-'));
+      try {
+        const result = {};
+        for (const name of ['cjs', 'esm']) {
+          const report = join(reports, `${name}.json`);
+          run(process.execPath, [
+            join(rootDir, '../../../cli/consumer-test-runner.mjs'),
+            rootDir,
+            'test',
+            context.mode,
+            String(context.primary),
+            report,
+          ], {
+            cwd: context.projectDir,
+            env: { UTOO_TEST_MODULE: name },
+            timeout: 240_000,
+          });
+          result[name] = readJson(report).result;
+        }
+        return { result, assets: [] };
+      } finally {
+        rmSync(reports, { recursive: true, force: true });
+      }
+    }
+
+    assert.ok(['cjs', 'esm'].includes(moduleMode));
+    const pkg = requirePackage('@utoo/pack/package.json');
+    if (context.mode !== 'baseline') {
+      assert.equal(pkg.name, '@ohos-npm-ports/utoo-pack');
+      assert.equal(pkg.version, context.portVersion);
+    }
+    const api = moduleMode === 'cjs' ? requirePackage('@utoo/pack') : await importPackage('@utoo/pack');
+    assert.equal(typeof api.build, 'function');
+    assert.equal(typeof api.serve, 'function');
+    const root = mkdtempSync(join(context.projectDir, '.utoo-test-'));
+    try {
+      writeFileSync(join(root, 'package.json'), '{"private":true}');
+      writeFileSync(join(root, 'entry.ts'), 'import "./style.css"; const proof: string = "utoo-native-proof"; document.body.dataset.port = proof; import("./lazy").then(m => document.body.dataset.lazy = m.lazy);');
+      writeFileSync(join(root, 'lazy.ts'), 'export const lazy: string = "utoo-lazy-proof";');
+      writeFileSync(join(root, 'style.css'), '.utoo-port { color: rgb(12, 34, 56); }');
+      writeFileSync(join(root, 'index.html'), '<!doctype html><html><head><title>native fixture</title></head><body><h1 class="utoo-port">utoo fixture</h1></body></html>');
+      await api.build({ config: {
+        entry: [{ name: 'main', import: './entry.ts', html: { template: join(root, 'index.html') } }],
+        output: { path: `./dist-${moduleMode}`, clean: true },
+        optimization: { minify: true },
+      } }, root, root);
+      const output = join(root, `dist-${moduleMode}`);
+      const files = readdirSync(output, { recursive: true }).filter(file => statSync(join(output, file)).isFile());
+      const scripts = files.filter(file => file.endsWith('.js')).map(file => readFileSync(join(output, file), 'utf8')).join('\n');
+      assert.ok(scripts.includes('utoo-native-proof'));
+      assert.ok(scripts.includes('utoo-lazy-proof'));
+      assert.ok(!scripts.includes('proof: string'));
+      const css = files.filter(file => file.endsWith('.css')).map(file => readFileSync(join(output, file), 'utf8')).join('\n');
+      assert.ok(css.includes('.utoo-port'));
+      const html = readFileSync(join(output, 'index.html'), 'utf8');
+      assert.ok(html.includes('utoo fixture'));
+      assert.match(html, /<script\b/);
+      assert.match(html, /<link\b/);
+      const assets = new Map(files.map(file => [`/${file.split(sep).join('/')}`, readFileSync(join(output, file))]));
+      const server = createServer((request, response) => {
+        const asset = assets.get(request.url);
+        response.writeHead(asset ? 200 : 404);
+        response.end(asset);
+      });
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      try {
+        for (const [url, content] of assets) {
+          const response = await fetch(`http://127.0.0.1:${server.address().port}${url}`);
+          assert.equal(response.status, 200);
+          assert.deepEqual(Buffer.from(await response.arrayBuffer()), content);
+        }
+      } finally {
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
+      return {
+        result: { typescript: true, css: true, html: true, dynamicImport: true, httpAssets: true },
+        assets: [],
+      };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 }

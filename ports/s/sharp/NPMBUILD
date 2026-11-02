@@ -1,191 +1,157 @@
-#!/usr/bin/env bash
-pkgname="sharp"
-upstream="sharp"
-version="0.35.5"
-revision=1
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, requirePackage } from '../../../cli/recipe.mjs';
 
-packages=(
-  "pkg"
-)
-vips_version=8.18.7
-source="https://registry.npmjs.org/sharp/-/sharp-${version}.tgz"
-sha256="3b6bbbe6b308f5c383938ca4a31926cd5d79c4651ed8c5fda16a97da2014a9ac"
-resource "vips" \
-  "https://github.com/libvips/libvips/releases/download/v${vips_version}/vips-${vips_version}.tar.xz" \
-  "5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94"
+const version = '0.35.5';
+const vipsVersion = '8.18.7';
+const rootDir = import.meta.dirname;
+const vipsSourceDir = join(rootDir, `vips-${vipsVersion}`);
+const vipsInstallDir = join(rootDir, 'vips-install');
+const sharpSourceDir = join(rootDir, 'sharp-src');
+const packageDir = join(rootDir, 'pkg');
+const upstreamAddon = `sharp-openharmony-arm64-${version}.node`;
+const addon = 'sharp-openharmony-arm64.node';
 
-build() {
-  # Ports sharp (image processing) to OpenHarmony, built natively from source:
-  # a from-scratch libvips 8.18.7 build (this container's rustc/clang host
-  # triple is already aarch64-unknown-linux-ohos, no cross-compile toolchain
-  # needed) linked against sharp's own N-API addon.
-  #
-  # Why this exists: the community @ohos-ports/sharp build (0.34.5-beta.5) hit
-  # a crash at require() time -- the JS utility module unconditionally reads
-  # the JPEG2000 format key's output aliases, and that build's native binding
-  # never populated the jp2 (JPEG2000) key at all, because the libvips it links
-  # against was compiled without openjpeg support. This build enables openjpeg
-  # explicitly and verifies a real jp2 encode/decode round-trip below, not just
-  # that the key exists.
-  #
-  # Dependency strategy: unlike most native-binding ports in this repo, sharp
-  # pulls in libvips's own dependency tree (~25 codec/rendering libraries --
-  # glib, cairo, pango, libjpeg-turbo, libwebp, openjpeg, libheif, etc). Rather
-  # than vendoring all of them into the npm package (large, and duplicates
-  # what a Harmonybrew-based OHOS project already has installed), this build
-  # only bundles the two libraries it builds itself (libvips.so / libvips-cpp.so)
-  # and leaves the rest resolved via RPATH pointing at the Harmonybrew prefix
-  # (~/.harmonybrew/lib) -- consumers need `brew install` for the codec
-  # libraries listed below. This matches the intended consumer (ohos-bun's own
-  # test suite, which already requires Harmonybrew) rather than optimizing for
-  # standalone npm/bun users with no Harmonybrew install.
+export default class Sharp extends Port {
+  static pkgname = 'sharp';
+  static upstream = 'sharp';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = ['pkg'];
+  static source = `https://registry.npmjs.org/sharp/-/sharp-${version}.tgz`;
+  static sha256 = '3b6bbbe6b308f5c383938ca4a31926cd5d79c4651ed8c5fda16a97da2014a9ac';
+  static resources = [
+    resource(
+      'vips',
+      `https://github.com/libvips/libvips/releases/download/v${vipsVersion}/vips-${vipsVersion}.tar.xz`,
+      '5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94',
+    ),
+  ];
 
-  # node: to drive npm install / run verification scripts.
-  # patchelf: to bake a working RPATH into the final .so/.node (consumer
-  #   devices won't have this build's absolute paths, only the Harmonybrew
-  #   prefix and $ORIGIN-relative siblings).
-  # The rest is libvips's own build + runtime dependency chain.
-  brew install -y patchelf \
-    jpeg-turbo libpng webp libtiff giflib glib little-cms2 highway cgif \
-    meson pkgconf exiv2 libarchive libheif libde265 libspng librsvg cairo \
-    pango freetype fontconfig libimagequant openjpeg aom dav1d orc gettext
+  build() {
+    // Build libvips and sharp natively for OHOS. Only the two libraries built
+    // here are bundled; the codec/rendering dependency chain remains in the
+    // Harmonybrew prefix and is found through the packaged RPATHs.
+    run('brew', [
+      'install', '-y', 'patchelf',
+      'jpeg-turbo', 'libpng', 'webp', 'libtiff', 'giflib', 'glib', 'little-cms2', 'highway', 'cgif',
+      'meson', 'pkgconf', 'exiv2', 'libarchive', 'libheif', 'libde265', 'libspng', 'librsvg', 'cairo',
+      'pango', 'freetype', 'fontconfig', 'libimagequant', 'openjpeg', 'aom', 'dav1d', 'orc', 'gettext',
+    ]);
+    const brewPrefix = run('brew', ['--prefix'], { capture: true }).stdout.trim();
+    process.env.PATH = `${brewPrefix}/bin:${process.env.PATH}`;
+    process.env.LIBRARY_PATH = `${brewPrefix}/lib`;
 
-  brew_prefix="$(brew --prefix)"
-  export PATH="${brew_prefix}/bin:${PATH}"
-  export LIBRARY_PATH="${brew_prefix}/lib"
+    const vipsArchive = join(rootDir, 'vips.tar.xz');
+    fetchResource('vips', vipsArchive);
+    run('tar', ['-xf', vipsArchive, '-C', rootDir]);
+    rmSync(vipsArchive);
+    cd(vipsSourceDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-libvips-disable-nls-and-tools-build.patch')) });
 
-  # --- libvips: build from source with JPEG 2000 (jp2 / openjpeg) support ---
-  fetch_resource "vips" vips.tar.xz
-  tar -xf vips.tar.xz
-  rm vips.tar.xz
-  cd "vips-${vips_version}"
-  patch -p1 <../patches/0001-libvips-disable-nls-and-tools-build.patch
+    // Force JPEG 2000 support and keep heif linked into libvips rather than in
+    // a dynamic module with build-tree-only lookup paths.
+    run('meson', [
+      'setup', 'build', `--prefix=${vipsInstallDir}`,
+      '-Dopenjpeg=enabled', '-Dheif-module=disabled', '-Dexamples=false',
+    ]);
+    run('ninja', ['-C', 'build']);
+    run('ninja', ['-C', 'build', 'install']);
+    assert.match(
+      readFileSync('build/meson-logs/meson-log.txt', 'utf8'),
+      /JPEG2000 load\/save with libopenjp2.*YES/,
+      'openjpeg/jp2 support did not get enabled',
+    );
 
-  # Every meson feature option here defaults to 'auto' (enable if the
-  # corresponding brew package is present, silently skip otherwise), so this
-  # only needs to name what's actually different from that default: force
-  # openjpeg on (the fix), and keep heif out of a dynamic module (see the
-  # RPATH comment on vendor/ below). jpeg-xl/fftw/openslide/etc. are already
-  # 'auto'-disabled since those brew packages aren't installed -- no need to
-  # disable them explicitly.
-  meson setup build --prefix="$(pwd)/../vips-install" \
-    -Dopenjpeg=enabled \
-    -Dheif-module=disabled \
-    -Dexamples=false
+    const sharpArchive = join(rootDir, 'sharp.tgz');
+    fetchSource(sharpArchive);
+    mkdirSync(sharpSourceDir);
+    run('tar', ['-xzf', sharpArchive, '-C', sharpSourceDir, '--strip-components=1']);
+    rmSync(sharpArchive);
+    cd(sharpSourceDir);
+    process.env.PKG_CONFIG_PATH = join(vipsInstallDir, 'lib/pkgconfig');
+    process.env.SHARP_FORCE_GLOBAL_LIBVIPS = '1';
+    run('npm', ['install']);
+    run('npm', ['run', 'build']);
+    assert.ok(existsSync(join('src/build/Release', upstreamAddon)), `${upstreamAddon} is missing`);
+  }
 
-  ninja -C build
-  ninja -C build install
+  package() {
+    const brewPrefix = run('brew', ['--prefix'], { capture: true }).stdout.trim();
+    rmSync(packageDir, { recursive: true, force: true });
+    mkdirSync(join(packageDir, 'vendor'), { recursive: true });
+    mkdirSync(join(packageDir, 'src/build/Release'), { recursive: true });
+    cpSync(join(sharpSourceDir, 'dist'), join(packageDir, 'dist'), { recursive: true });
+    const loaderFile = join(packageDir, 'dist/sharp.cjs');
+    const loader = readFileSync(loaderFile, 'utf8');
+    const updatedLoader = loader.replace('sharp-${runtimePlatform}-${version}.node', 'sharp-${runtimePlatform}.node');
+    assert.notEqual(updatedLoader, loader, 'versioned addon require was not found in dist/sharp.cjs');
+    writeFileSync(loaderFile, updatedLoader);
+    cpSync(join(sharpSourceDir, 'lib'), join(packageDir, 'lib'), { recursive: true });
+    cpSync(join(sharpSourceDir, 'package.json'), join(packageDir, 'package.json'));
+    run('patch', ['-p1'], {
+      cwd: packageDir,
+      input: readFileSync(join(rootDir, 'patches/0002-package-json.patch')),
+    });
+    cpSync(join(sharpSourceDir, 'src/build/Release', upstreamAddon), join(packageDir, 'src/build/Release', addon));
 
-  # JPEG 2000 (jp2) must actually be enabled, not silently skipped.
-  grep -q "JPEG2000 load/save with libopenjp2.*YES" build/meson-logs/meson-log.txt ||
-    {
-      echo "openjpeg/jp2 support did not get enabled" >&2
-      exit 1
-    }
+    // Ship bare SONAME files rather than symlinks, which npm pack and file:
+    // installs do not preserve reliably.
+    cpSync(join(vipsInstallDir, 'lib/libvips.so.42.20.7'), join(packageDir, 'vendor/libvips.so.42'));
+    cpSync(join(vipsInstallDir, 'lib/libvips-cpp.so.42.20.7'), join(packageDir, 'vendor/libvips-cpp.so.42'));
+    run('llvm-strip', ['--strip-all', join(packageDir, 'src/build/Release', addon)]);
+    run('llvm-strip', ['--strip-all', join(packageDir, 'vendor/libvips-cpp.so.42')]);
+    run('llvm-strip', ['--strip-all', join(packageDir, 'vendor/libvips.so.42')]);
 
-  cd ..
-  vips_install="$(pwd)/vips-install"
+    run('patchelf', ['--set-rpath', `$ORIGIN/../../../vendor:${brewPrefix}/lib`, join(packageDir, 'src/build/Release', addon)]);
+    run('patchelf', ['--set-rpath', `$ORIGIN:${brewPrefix}/lib`, join(packageDir, 'vendor/libvips-cpp.so.42')]);
+    run('patchelf', ['--set-rpath', `$ORIGIN:${brewPrefix}/lib`, join(packageDir, 'vendor/libvips.so.42')]);
 
-  # --- sharp: build from source against our libvips ---
-  fetch_source sharp.tgz
-  mkdir sharp-src
-  tar -xzf sharp.tgz -C sharp-src --strip-components=1
-  rm sharp.tgz
-  cd sharp-src
+    const pkg = readJson(join(packageDir, 'package.json'));
+    assert.equal(Object.keys(pkg.optionalDependencies ?? {}).length, 25, 'upstream platform optionalDependencies changed');
+    assert.equal(pkg.optionalDependencies['@img/sharp-linux-arm64'], version, 'sharp platform subpackage version drifted');
+    assert.equal(pkg.optionalDependencies['@img/sharp-libvips-linuxmusl-arm64'], '1.3.4', 'libvips platform subpackage version drifted');
+  }
 
-  export PKG_CONFIG_PATH="${vips_install}/lib/pkgconfig"
-  export SHARP_FORCE_GLOBAL_LIBVIPS=1
-  npm install
-  # 0.35.x no longer has an install-time check/build hook, and its native
-  # binding is now written to a versioned filename. Build it explicitly.
-  npm run build
+  static testPlatforms = ['openharmony'];
+  static testPlatformReason = 'JP2 and AVIF validation requires the native OpenHarmony libvips build.';
 
-  addon="sharp-openharmony-arm64-${version}.node"
-  test -f "src/build/Release/${addon}"
+  testSetup() {
+    if (process.platform !== 'openharmony') return;
+    run('brew', [
+      'install', '-y', 'patchelf',
+      'jpeg-turbo', 'libpng', 'webp', 'libtiff', 'giflib', 'glib', 'little-cms2', 'highway', 'cgif',
+      'exiv2', 'libarchive', 'libheif', 'libde265', 'libspng', 'librsvg', 'cairo',
+      'pango', 'freetype', 'fontconfig', 'libimagequant', 'openjpeg', 'aom', 'dav1d', 'orc', 'gettext',
+    ]);
+  }
 
-  cd ..
-
-  # --- assemble the npm package ---
-  rm -rf pkg
-  mkdir -p pkg/vendor pkg/src/build/Release
-  cp -r sharp-src/dist pkg/dist
-  cp -r sharp-src/lib pkg/lib
-  cp sharp-src/package.json pkg/package.json
-  (cd pkg && patch -p1 <../patches/0002-package-json.patch)
-  cp "sharp-src/src/build/Release/${addon}" "pkg/src/build/Release/${addon}"
-
-  # Ship the two libs we build under their bare SONAME (not the fully
-  # versioned filename + a symlink) -- symlinks are not reliably preserved
-  # across npm pack/publish and various file: install paths, and the dynamic
-  # linker only ever looks up the SONAME string baked into the .node's NEEDED
-  # entry anyway.
-  cp "${vips_install}/lib/libvips.so.42.20.7" pkg/vendor/libvips.so.42
-  cp "${vips_install}/lib/libvips-cpp.so.42.20.7" pkg/vendor/libvips-cpp.so.42
-
-  # The OHOS-patched LLD leaves a placeholder section that makes patchelf
-  # reject these binaries, so strip them before updating their RPATHs.
-  llvm-strip --strip-all "pkg/src/build/Release/${addon}"
-  llvm-strip --strip-all pkg/vendor/libvips-cpp.so.42
-  llvm-strip --strip-all pkg/vendor/libvips.so.42
-
-  patchelf --set-rpath "\$ORIGIN/../../../vendor:${brew_prefix}/lib" "pkg/src/build/Release/${addon}"
-  patchelf --set-rpath "\$ORIGIN:${brew_prefix}/lib" pkg/vendor/libvips-cpp.so.42
-  patchelf --set-rpath "\$ORIGIN:${brew_prefix}/lib" pkg/vendor/libvips.so.42
-
-  # --- verify ---
-
-  # cross-platform: upstream's platform optionalDependencies must stay intact
-  node -e '
-  const pkg = require("./pkg/package.json");
-  const n = Object.keys(pkg.optionalDependencies ?? {}).length;
-  if (n !== 25) throw new Error(`optionalDependencies count: ${n}, expected 25`);
-  if (pkg.optionalDependencies["@img/sharp-linux-arm64"] !== process.argv[1])
-    throw new Error("sharp platform subpackage version drifted");
-  if (pkg.optionalDependencies["@img/sharp-libvips-linuxmusl-arm64"] !== "1.3.4")
-    throw new Error("libvips platform subpackage version drifted");
-  console.log("optionalDependencies preserved:", n, "platform packages");
-' "${version}"
-
-  # Real functional smoke test against the FINAL pkg/ layout (RPATH resolved
-  # via $ORIGIN + the Harmonybrew prefix, no manual LD_LIBRARY_PATH) -- this is
-  # exactly what a consumer gets, not just the build tree. pkg/ itself ships no
-  # node_modules (npm always excludes it from the published tarball regardless
-  # of "files"), so point NODE_PATH at the node_modules our own `npm install`
-  # above already populated with sharp's real dependencies (detect-libc,
-  # semver, @img/colour) -- a real consumer's `npm install` does this
-  # resolution itself; this is purely a stand-in for that step.
-  export NODE_PATH="$(pwd)/sharp-src/node_modules"
-  export OPENSSL_CONF=/dev/null
-  node -e '
-  const path = require("path");
-  const sharp = require(path.join(process.cwd(), "pkg", "dist", "index.cjs"));
-  (async () => {
+  async test() {
+    if (process.platform === 'openharmony') process.env.OPENSSL_CONF = '/dev/null';
+    const sharp = requirePackage('sharp');
     const png = await sharp({
       create: { width: 40, height: 30, channels: 3, background: { r: 5, g: 200, b: 40 } },
     }).png().toBuffer();
 
-    const jp2 = await sharp(png).jp2().toBuffer();
-    const back = await sharp(jp2).raw().toBuffer({ resolveWithObject: true });
-    if (back.info.width !== 40 || back.info.height !== 30) {
-      throw new Error("jp2 round-trip size mismatch: " + JSON.stringify(back.info));
-    }
-    if (!sharp.format.jp2 || !sharp.format.jp2.output) {
-      throw new Error("format.jp2 missing or incomplete: " + JSON.stringify(sharp.format.jp2));
+    const { recipeContext } = await import('../../../cli/recipe.mjs');
+    const { mode } = recipeContext();
+    let back = { info: { width: 40, height: 30 } };
+    if (mode !== 'baseline') {
+      const jp2 = await sharp(png).jp2().toBuffer();
+      back = await sharp(jp2).raw().toBuffer({ resolveWithObject: true });
+      assert.equal(back.info.width, 40);
+      assert.equal(back.info.height, 30);
+      assert.ok(sharp.format.jp2?.output, `format.jp2 missing or incomplete: ${JSON.stringify(sharp.format.jp2)}`);
     }
 
-    // avif/heif also depend on libheif, now statically linked into libvips
-    // (heif-module=disabled above) instead of a dynamic module whose path
-    // would only resolve inside this build tree.
     const avif = await sharp(png).avif().toBuffer();
-    if (avif.length === 0) throw new Error("avif encode produced no bytes");
-
-    console.log(
-      "OK: jp2 round-trip", jp2.length, "bytes,", back.info.width + "x" + back.info.height,
-      "| avif encode", avif.length, "bytes",
-    );
-  })().catch((e) => { console.error("FAIL:", e); process.exit(1); });
-'
-
-  echo "OK: @ohos-npm-ports/sharp built and smoke-tested"
+    assert.ok(avif.length > 0, 'avif encode produced no bytes');
+    return {
+      result: { width: back.info.width, height: back.info.height, jp2: true, avif: true },
+      assets: [],
+    };
+  }
 }

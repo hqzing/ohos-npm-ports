@@ -1,6 +1,6 @@
 # npm-ports 命令行工具
 
-`npm-ports` 命令行工具用于创建、编辑、构建、检查、打包和滚动更新 NPMBUILD port。
+`npm-ports` 用于创建、编辑、构建、打包、滚动更新和验证 JavaScript class NPMBUILD port。运行时使用 Node.js 26.13.0。
 
 ## 安装与 port 参数
 
@@ -10,7 +10,7 @@
 export PATH="$PWD/cli:$PATH"
 ```
 
-完成后使用 `npm-ports <command>`。`<port>` 可以是发布短名、带版本线的短名或完整 port 目录，例如：
+`<port>` 可以是发布短名、带版本线的短名或完整目录：
 
 ```sh
 npm-ports info parcel-watcher
@@ -25,16 +25,9 @@ npm-ports create <upstream> [--set-name <port>] [--set-version <version>] [--no-
 npm-ports edit <port>
 ```
 
-`npm-ports create` 接受 npm 上游包名，例如 `is-number` 或 `@parcel/watcher`：
+`create` 默认查询 registry，取得最新版本和 tarball 并计算 SHA-256，生成 `ports/<首字母>/<port>/NPMBUILD`。scoped 上游默认扁平化为 `scope-name`，可用 `--set-name` 覆盖。`--set-version` 指定版本，`--no-fetch` 不访问 registry 并留空待补字段。已有 port 不会被覆盖。
 
-- 默认查询 registry，取得最新版本和 tarball，并下载计算 SHA-256。
-- `--set-name` 覆盖默认发布短名。scoped 上游默认按 `scope/name` → `scope-name` 扁平化。
-- `--set-version` 指定上游版本，而不是默认的最新版本。
-- `--no-fetch` 不访问 registry，未确定的版本和 SHA-256 留待手工填写。
-- 生成 `ports/<首字母>/<port>/NPMBUILD`，已有 port 不会被覆盖。
-- 骨架包含下载校验、解包和基础发布短名改写。移植补丁和实际构建逻辑需要继续完善。
-
-`npm-ports create` 和 `npm-ports edit` 都会打开 NPMBUILD。编辑器依次取 `VISUAL`、`EDITOR`，未设置时使用 vim。`npm-ports edit` 一次只接受一个 port，可直接使用版本线短名定位目标配方。
+`create` 和 `edit` 使用 `VISUAL`、`EDITOR` 指定的编辑器，默认 vim。`edit` 一次只接受一个 port。
 
 ## 查询与静态检查
 
@@ -44,29 +37,45 @@ npm-ports info <port|--all> [--json]
 npm-ports lint [port|--all]
 ```
 
-`npm-ports list` 列出全部 port。`npm-ports info` 查看上游、版本、dist-tag 和产物。
+`list` 列出全部 port，`info` 查看上游、版本、dist-tag、产物和测试声明。
 
-`npm-ports lint` 检查元数据、首字母目录、发布短名冲突、产物路径、Bash 语法、孤立 patch、遗留 publish.sh、旧元数据别名、版本字面量、重复全局声明、重复 SHA-256、readelf、签名逻辑、连续空行和构建内直接发布等现行规则。`npm-ports lint` 不能替代真实构建，也不能证明上游 patch 仍然兼容。
+`lint` 检查 ESM 语法、class 元数据、版本线、发布短名冲突、产物路径、bump 可编辑声明、资源、测试布局、孤立 patch、revision、发布边界、签名逻辑、连续空行和 build/test/docs 分区。lint 不能替代真实构建，也不能证明上游 patch 仍兼容。
 
-## 构建、检查与打包
+## 构建与打包
 
 ```sh
 npm-ports prepare <port>
 npm-ports build <port>
 npm-ports package <port>
-npm-ports check <port>
 npm-ports pack <port> [--no-build]
 ```
 
-这些命令按 `prepare() → build() → package() → normalize → check()` 的顺序自动执行到对应阶段：
+构建顺序为 `prepare() → build() → package() → normalize`：
 
-- `npm-ports prepare`：执行 `prepare()`。
-- `npm-ports build`：自动执行 `prepare()` 和 `build()`。
-- `npm-ports package`：再执行 `package()`，随后统一注入全部发布包的名称、repository、最终发布版本和同 port 槽位引用。
-- `npm-ports check`：再执行 `check()`，验证规范化后的实际发布目录。上游版本使用 `${version}`，最终发布版本从实际 package.json 读取。
-- `npm-ports pack`：执行完整生命周期，统一为发布目录中的 AArch64 ELF 签名，然后生成 npm tarball。`--no-build` 只复用已经通过检查的发布目录。
+- `prepare`：执行 `prepare()`。
+- `build`：自动执行 `prepare()` 和 `build()`。
+- `package`：再执行 `package()`，随后统一注入包名、repository、最终版本和槽位引用。
+- `pack`：完成构建与 normalize，统一签名并生成 npm tarball。`--no-build` 复用已经生成的发布目录。
 
-同一主包或槽位的钩子在同一 Bash 进程内执行，主包和槽位之间隔离。槽位在同一 NPMBUILD 中声明，不另建独立 port。字段、钩子和执行规则的详细规范见 [NPMBUILD 配方规范](port-spec.md)。
+主包和槽位分别在同一 Node 进程内执行钩子，主包与槽位之间隔离。没有 `check()` 钩子；构建和产物断言放在 `build()`、`package()` 或 normalize，安装后功能验证放在 `test()`。
+
+## 安装后测试
+
+```sh
+npm-ports test <port> [--no-build]
+```
+
+`test` 通过临时 Verdaccio 和实际 consumer fixture 安装 tarball，再调用配方唯一的 `test()`。本地和 CI 使用同一执行器、模块解析上下文和报告格式。`--no-build` 复用已有 artifact；依赖的已发布 port 可以自动下载。
+
+`check` 暂时作为 `test` 的兼容别名，新文档和新配方只使用 `test`。
+
+发布安装与 integrity 验证使用：
+
+```sh
+npm-ports validate-publish <port>
+```
+
+它打包全部产物，发布到临时 Verdaccio，校验 tarball 和 integrity，并在干净目录实际安装。推荐顺序见 [验证标准](verification.md)。
 
 ## 上游升级与修订
 
@@ -76,24 +85,19 @@ npm-ports bump-pr <port> [--no-draft] [--base main]
 npm-ports revision <port> [--set N]
 ```
 
-这些命令分别用于查询上游升级、创建升级 PR 和递增移植修订号：
+- `bump` 根据 `upstream` 查询 npm dist-tags 和版本列表。主 port 跟随指定 dist-tag，`@` port 只选择版本线内最高 semver。
+- `bump --write` 精确修改顶部 `version`、`static revision`、主 `source` / `sha256` 及所有引用 `${version}` 的资源摘要，并将 revision 重置为 1。固定 commit、工具链和独立版本资源保持锁定，不做全局替换。
+- `bump-pr` 一次只处理一个 port，按目标版本创建分支、提交、普通推送和 PR。默认草稿，`--no-draft` 用于已配置的 GitHub App。已有开放 PR 修改同一 port 时跳过，不强推、不覆盖。
+- `revision` 在上游版本不变时递增修订号。只有需要发布新产物时才递增；纯格式或语言迁移不递增。
 
-- `npm-ports bump` 根据 `upstream` 查询 npm registry 的 dist-tags 和版本列表。主 port 跟随指定 dist-tag，`@` port 只选择版本线内最高 semver。预览线可通过 `upstream_tag` 指定上游标签。
-- `npm-ports bump --write` 精确修改 `version`、主 `source` / `sha256` 及所有引用 `${version}` 的 `resource` 声明，重新计算下载摘要并将 revision 重置为 1。含独立版本变量、固定工具链版本或 commit 的资源保持锁定。注释、普通构建参数和补丁不做全局替换。
-- 当 npm 预览版本与源码 tag 或 commit 没有可靠映射时，配方必须设置 `bump=false`，防止自动升级生成错配 PR。
-- `npm-ports bump-pr` 一次只处理一个 port，完成更新、按目标版本命名分支、提交、普通推送和 PR 创建。默认草稿，`--no-draft` 用于已配置的 GitHub App。只要已有开放 PR 修改同一 port，无论是同版本还是旧版本、机器人还是人工提交，都会跳过，绝不强推或覆盖原 PR。
-- `npm-ports revision` 在上游版本不变时递增移植修订号，最终版本为 `<上游版本>-<revision>`。
-- revision 是发布版本号，不是触发重新编译的开关。只有需要发布新产物时才递增。纯格式调整不需要递增。需要重新发布同一上游版本的新产物时必须递增，npm 不允许覆盖已发布版本。
+升级或修订后必须执行真实构建和安装测试，不能只改元数据。
 
-升级或修订后必须执行真实构建，不能只修改元数据。补丁兼容性仍需人工审查和验证。
-
-## 发布与验证
+## 发布
 
 ```sh
-npm-ports publish <port> [--dry-run] [--registry URL]
-npm-ports validate-publish <port>
+npm-ports publish <port> [--dry-run] [--registry URL] [--skip-existing] [--expect-sha SHA]
 ```
 
-`npm-ports publish` 只发布通过检查的 tarball，不重新执行生命周期。日常验证使用 `--dry-run` 或临时 Verdaccio。正式发布由发布工作流完成，不要在 NPMBUILD 内执行 `npm publish`。
+`publish` 只发布已生成的 tarball，不重新执行生命周期。日常验证使用 `--dry-run` 或临时 Verdaccio。正式发布由 CI 的独立发布 job 完成，不要在 NPMBUILD 内执行 `npm publish`。
 
-`npm-ports validate-publish` 打包全部产物，发布到临时 Verdaccio，校验 tarball 和 integrity，并在干净目录实际安装。推荐检查顺序见 [验证标准](verification.md)。命令总览可随时通过 `npm-ports --help` 查看。
+命令总览可随时通过 `npm-ports --help` 查看。

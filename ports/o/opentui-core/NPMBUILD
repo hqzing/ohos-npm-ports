@@ -1,237 +1,275 @@
-#!/usr/bin/env bash
-pkgname="opentui-core"
-upstream="@opentui/core"
-version="0.8.1"
-revision=1
-source="https://registry.npmjs.org/@opentui/core/-/core-${version}.tgz"
-sha256="91f980e93c67ce71d0fac3f5ca773decee2c008174f04bd357b024246dad953a"
-resource "upstream" \
-  "https://codeload.github.com/anomalyco/opentui/tar.gz/refs/tags/v${version}" \
-  "3418421c786f56c30a438c00b268d1b653d3efa826ff40fcffb72df7ae8bb765"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, writeJson, recipeContext } from '../../../cli/recipe.mjs';
 
-packages=(
-  "@ohos-npm-ports/opentui-core-openharmony-arm64:slots/openharmony-arm64/opentui-core-openharmony-arm64-${version}"
-  "opentui-core-${version}"
-)
-root_dir="$NPMBUILD_DIR"
-port_dir="$NPMBUILD_DIR"
-source_dir="opentui-${version}"
-package_dir="${pkgname}-${version}"
-dist_dir="${source_dir}/packages/core/dist"
-ohos_triple=aarch64-linux-ohos
-native_lib="${source_dir}/packages/native/lib/${ohos_triple}/libopentui.so"
+const version = '0.8.1';
+const rootDir = import.meta.dirname;
+const sourceDir = join(rootDir, `opentui-${version}`);
+const packageDir = join(rootDir, `opentui-core-${version}`);
+const distDir = join(sourceDir, 'packages/core/dist');
+const ohosTriple = 'aarch64-linux-ohos';
+const slotRootDir = join(rootDir, 'slots/openharmony-arm64');
+const slotSourceDir = join(slotRootDir, `opentui-${version}`);
+const slotPackageDir = join(slotRootDir, `opentui-core-openharmony-arm64-${version}`);
+const slotNativeLib = join(slotSourceDir, `packages/native/lib/${ohosTriple}/libopentui.so`);
 
-prepare() {
-  # JS bundle 用上游同版本 bun 从 v0.8.1 源码重建（0002 在 src 层注入 openharmony
-  # 分支），官方构建产物零改动；native 不随父包发布，由平台槽位包
-  # @opentui/core-openharmony-arm64（ports/o/opentui-core/slots/openharmony-arm64）
-  # 经 optionalDependencies npm alias 提供，bun --compile 消费时由消费方 bundler
-  # 经槽位包内嵌 aarch64-linux-ohos 的 libopentui.so。
-  # 分区同构 brew 内部流水线：deps（工具链）→ fetch（物料+sha256）→ build（补丁+
-  # 构建+拼接）→ package（发布形态收尾）→ test（静态断言 + e2e 真跑）。
-
-  # ============================== 声明 ==============================
-
-  unset LD_PRELOAD
-
-  # ============================== deps ==============================
-  brew install bun
-  bun --version
-
-  brew list --versions ohos-sdk-native >/dev/null 2>&1 || brew install -y ohos-sdk-native
-  brew install zig@0.17
-  zig version
-  export ZIG_GLOBAL_CACHE_DIR="${root_dir}/zig-cache"
-
-  ohos_sdk=$(brew --prefix ohos-sdk-native)
-  ohos_sysroot="${ohos_sdk}/sysroot"
-  ohos_clang_runtime=
-  for candidate in "${ohos_sdk}"/llvm/lib/clang/*/lib/"${ohos_triple}"; do
-    [ -d "$candidate" ] && ohos_clang_runtime="$candidate"
-  done
-  [ -d "${ohos_sysroot}/usr/lib/${ohos_triple}" ] || {
-    echo "OHOS sysroot is missing ${ohos_triple} libraries" >&2
-    exit 1
+function listFiles(root, dir = root) {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const file = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...listFiles(root, file));
+    else files.push(relative(root, file).split(sep).join('/'));
   }
-  [ -n "$ohos_clang_runtime" ] || {
-    echo "OHOS Clang runtime is missing for ${ohos_triple}" >&2
-    exit 1
+  return files.sort();
+}
+
+function configureOhos(root, toolchains = false) {
+  const installed = run('brew', ['list', '--versions', 'ohos-sdk-native'], {
+    capture: true,
+    allowExitCodes: [0, 1],
+  });
+  if (installed.code !== 0) run('brew', ['install', '-y', 'ohos-sdk-native']);
+  if (toolchains) run('brew', ['install', 'ohos-sdk-toolchains']);
+  run('brew', ['install', 'zig@0.17']);
+  run('zig', ['version']);
+  process.env.ZIG_GLOBAL_CACHE_DIR = join(root, 'zig-cache');
+
+  const ohosSdk = run('brew', ['--prefix', 'ohos-sdk-native'], { capture: true }).stdout.trim();
+  const ohosSysroot = join(ohosSdk, 'sysroot');
+  let ohosClangRuntime = '';
+  const clangRoot = join(ohosSdk, 'llvm/lib/clang');
+  if (existsSync(clangRoot)) {
+    for (const entry of readdirSync(clangRoot, { withFileTypes: true })) {
+      const candidate = join(clangRoot, entry.name, 'lib', ohosTriple);
+      if (entry.isDirectory() && existsSync(candidate) && statSync(candidate).isDirectory()) ohosClangRuntime = candidate;
+    }
   }
-  export ZIG_LIBC="${root_dir}/ohos-libc.txt"
-  cat >"$ZIG_LIBC" <<EOF
-include_dir=${ohos_sysroot}/usr/include
-sys_include_dir=${ohos_sysroot}/usr/include/${ohos_triple}
-crt_dir=${ohos_sysroot}/usr/lib/${ohos_triple}
-msvc_lib_dir=
-kernel32_lib_dir=
-darwin_sdk_dir=
-cc_dir=${ohos_clang_runtime}
-EOF
+  assert.ok(
+    existsSync(join(ohosSysroot, 'usr/lib', ohosTriple)) && statSync(join(ohosSysroot, 'usr/lib', ohosTriple)).isDirectory(),
+    `OHOS sysroot is missing ${ohosTriple} libraries`,
+  );
+  assert.ok(ohosClangRuntime, `OHOS Clang runtime is missing for ${ohosTriple}`);
 
-  fetch_source "core.tgz"
-  tar -zxf core.tgz
-  rm core.tgz
-  mv package "${package_dir}"
-
-  fetch_resource "upstream" "${source_dir}.tar.gz"
-  tar -zxf "${source_dir}.tar.gz"
-  rm "${source_dir}.tar.gz"
+  process.env.ZIG_LIBC = join(root, 'ohos-libc.txt');
+  writeFileSync(process.env.ZIG_LIBC, [
+    `include_dir=${join(ohosSysroot, 'usr/include')}`,
+    `sys_include_dir=${join(ohosSysroot, 'usr/include', ohosTriple)}`,
+    `crt_dir=${join(ohosSysroot, 'usr/lib', ohosTriple)}`,
+    'msvc_lib_dir=',
+    'kernel32_lib_dir=',
+    'darwin_sdk_dir=',
+    `cc_dir=${ohosClangRuntime}`,
+    '',
+  ].join('\n'));
 }
 
-build() {
-  cd "${root_dir}/${source_dir}"
-  patch -p1 <"${port_dir}/patches/0002-openharmony-core-src.patch"
-  patch -p1 <"${port_dir}/patches/0003-ohos-weak-pthread-tryjoin.patch"
-  patch -p1 <"${port_dir}/patches/0004-skip-native-abi-check.patch"
-  patch -p1 <"${port_dir}/patches/0005-ohos-zig-target.patch"
-  # toybox patch 对错 header 静默 no-op，打完必须 grep marker
-  grep -q '"#opentui/parser-worker"' packages/core/scripts/build.ts
-  grep -q 'core-openharmony-arm64' packages/core/src/platform/runtime-assets.bun.ts
-  grep -q 'core-openharmony-arm64' packages/core/src/platform/runtime-assets.node.ts
-  grep -q 'linkage = .weak' packages/native/src/clipboard/host.zig
-  grep -q '"aarch64-linux-ohos"' packages/native/build.zig
-
-  bun install --ignore-scripts
-  cd packages/core
-  OPENTUI_SKIP_NATIVE_ABI_CHECK=1 bun scripts/build.ts --lib
-
-  # 拼接：JS 全量取重建产物，其余（d.ts/assets/LICENSE/README）留官方
-  cd "${root_dir}"
-  rm -f "${package_dir}"/*.js "${package_dir}"/*.js.map
-  rm -f "${package_dir}/lib/tree-sitter/update-assets.js" \
-    "${package_dir}/lib/tree-sitter/update-assets.js.map"
-  for f in "${dist_dir}"/*.js "${dist_dir}"/*.js.map; do
-    cp "$f" "${package_dir}/"
-  done
-  cp "${dist_dir}/lib/tree-sitter/update-assets.js" "${package_dir}/lib/tree-sitter/"
-  cp "${dist_dir}/lib/tree-sitter/update-assets.js.map" "${package_dir}/lib/tree-sitter/"
+function assertChunkMarker(pattern, marker) {
+  const files = readdirSync(packageDir).filter((file) => file.startsWith(pattern) && file.endsWith('.js'));
+  assert.ok(files.some((file) => readFileSync(join(packageDir, file), 'utf8').includes(marker)), `${pattern}*.js: ${marker}`);
 }
 
-package() {
-  cd "${root_dir}/${package_dir}"
-  patch -p1 <"${port_dir}/patches/0001-update-package-json.patch"
-  cd "${root_dir}"
-  # 父包不携带 native，槽位包负责
-  if find "${package_dir}" -name '*.so' | grep -q .; then
-    echo "parent package must not ship native libraries" >&2
-    exit 1
-  fi
+function copySlotLicenses(source, destination) {
+  const vendor = join(source, 'packages/native/src/vendor');
+  for (const [file, target] of [
+    ['wuffs/LICENSE', 'LICENSE-WUFFS'],
+    ['stb/LICENSE', 'LICENSE-STB'],
+    ['libwebp/COPYING', 'LICENSE-LIBWEBP'],
+    ['libwebp/PATENTS', 'PATENTS-LIBWEBP'],
+    ['libwebp/AUTHORS', 'AUTHORS-LIBWEBP'],
+    ['lcms2/LICENSE', 'LICENSE-LCMS2'],
+  ]) {
+    cpSync(join(vendor, file), join(destination, target));
+  }
+  cpSync(join(source, 'packages/core/THIRD_PARTY_LICENSES/GHOSTTY'), join(destination, 'LICENSE-GHOSTTY'));
 }
 
-check() {
-  export ZIG_GLOBAL_CACHE_DIR="${root_dir}/zig-cache"
-  export ZIG_LIBC="${root_dir}/ohos-libc.txt"
-  test -s "$ZIG_LIBC"
-  # --- 包静态断言 ---
-  cd "${root_dir}/${package_dir}"
-  grep -q '"#opentui/parser-worker": "./parser.worker.js"' package.json
+function writeSlotPackage() {
+  writeFileSync(join(slotPackageDir, 'index.js'), 'import { fileURLToPath } from "node:url"\n\nexport default fileURLToPath(new URL("./libopentui.so", import.meta.url))\n');
+  writeFileSync(join(slotPackageDir, 'index.bun.js'), 'const module = await import("./libopentui.so", { with: { type: "file" } })\n\nexport default module.default\n');
+  writeFileSync(join(slotPackageDir, 'index.d.ts'), 'declare const path: string\nexport default path\n');
+  writeJson(join(slotPackageDir, 'package.json'), {
+    version,
+    description: 'Prebuilt openharmony-arm64 binaries for @opentui/core',
+    type: 'module',
+    main: 'index.js',
+    module: 'index.js',
+    types: 'index.d.ts',
+    license: 'MIT',
+    author: 'OpenTUI Contributors',
+    exports: {
+      '.': {
+        bun: './index.bun.js',
+        import: './index.js',
+        types: './index.d.ts',
+      },
+    },
+    os: ['openharmony'],
+    cpu: ['arm64'],
+  });
+  cpSync(slotNativeLib, join(slotPackageDir, 'libopentui.so'));
+  cpSync(join(slotSourceDir, 'LICENSE'), join(slotPackageDir, 'LICENSE'));
+  copySlotLicenses(slotSourceDir, slotPackageDir);
+}
 
-  for f in ./*.js ./lib/tree-sitter/*.js; do
-    node --check "$f"
-  done
+export default class OpentuiCore extends Port {
+  static pkgname = 'opentui-core';
+  static upstream = '@opentui/core';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [
+    `@ohos-npm-ports/opentui-core-openharmony-arm64:slots/openharmony-arm64/opentui-core-openharmony-arm64-${version}`,
+    `opentui-core-${version}`,
+  ];
+  static source = `https://registry.npmjs.org/@opentui/core/-/core-${version}.tgz`;
+  static sha256 = '91f980e93c67ce71d0fac3f5ca773decee2c008174f04bd357b024246dad953a';
+  static resources = [
+    resource(
+      'upstream',
+      `https://codeload.github.com/anomalyco/opentui/tar.gz/refs/tags/v${version}`,
+      '3418421c786f56c30a438c00b268d1b653d3efa826ff40fcffb72df7ae8bb765',
+    ),
+  ];
+  prepare() {
+    delete process.env.LD_PRELOAD;
+    run('brew', ['install', 'bun']);
+    run('bun', ['--version']);
+    configureOhos(rootDir);
 
-  # 上游平台包保留裸上游版本，槽位 alias 使用最终发布版本。
-  node -e '
-    const pkg = require("./package.json");
-    const base = process.argv[1];
-    const opt = pkg.optionalDependencies ?? {};
+    fetchSource(join(rootDir, 'core.tgz'));
+    run('tar', ['-zxf', 'core.tgz'], { cwd: rootDir });
+    rmSync(join(rootDir, 'core.tgz'));
+    renameSync(join(rootDir, 'package'), packageDir);
+
+    fetchResource('upstream', join(rootDir, `opentui-${version}.tar.gz`));
+    run('tar', ['-zxf', `opentui-${version}.tar.gz`], { cwd: rootDir });
+    rmSync(join(rootDir, `opentui-${version}.tar.gz`));
+  }
+
+  build() {
+    cd(sourceDir);
+    for (const patch of [
+      '0002-openharmony-core-src.patch',
+      '0003-ohos-weak-pthread-tryjoin.patch',
+      '0004-skip-native-abi-check.patch',
+      '0005-ohos-zig-target.patch',
+    ]) {
+      run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches', patch)) });
+    }
+    assert.ok(readFileSync('packages/core/scripts/build.ts', 'utf8').includes('"#opentui/parser-worker"'));
+    assert.ok(readFileSync('packages/core/src/platform/runtime-assets.bun.ts', 'utf8').includes('core-openharmony-arm64'));
+    assert.ok(readFileSync('packages/core/src/platform/runtime-assets.node.ts', 'utf8').includes('core-openharmony-arm64'));
+    assert.ok(readFileSync('packages/native/src/clipboard/host.zig', 'utf8').includes('linkage = .weak'));
+    assert.ok(readFileSync('packages/native/build.zig', 'utf8').includes('"aarch64-linux-ohos"'));
+
+    run('bun', ['install', '--ignore-scripts']);
+    run('bun', ['scripts/build.ts', '--lib'], {
+      cwd: join(sourceDir, 'packages/core'),
+      env: { OPENTUI_SKIP_NATIVE_ABI_CHECK: '1' },
+    });
+
+    for (const file of readdirSync(packageDir)) {
+      if (file.endsWith('.js') || file.endsWith('.js.map')) rmSync(join(packageDir, file), { force: true });
+    }
+    rmSync(join(packageDir, 'lib/tree-sitter/update-assets.js'), { force: true });
+    rmSync(join(packageDir, 'lib/tree-sitter/update-assets.js.map'), { force: true });
+    for (const file of readdirSync(distDir)) {
+      if (file.endsWith('.js') || file.endsWith('.js.map')) cpSync(join(distDir, file), join(packageDir, file));
+    }
+    cpSync(join(distDir, 'lib/tree-sitter/update-assets.js'), join(packageDir, 'lib/tree-sitter/update-assets.js'));
+    cpSync(join(distDir, 'lib/tree-sitter/update-assets.js.map'), join(packageDir, 'lib/tree-sitter/update-assets.js.map'));
+  }
+
+  package() {
+    cd(packageDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-update-package-json.patch')) });
+    assert.ok(!listFiles(packageDir).some((file) => file.endsWith('.so')), 'parent package must not ship native libraries');
+    assert.ok(statSync(join(rootDir, 'ohos-libc.txt')).size > 0);
+
+    const pkg = readJson(join(packageDir, 'package.json'));
+    assert.equal(pkg.imports['#opentui/parser-worker'], './parser.worker.js');
+    for (const file of listFiles(packageDir)) {
+      if ((file.split('/').length === 1 || file.startsWith('lib/tree-sitter/')) && file.endsWith('.js')) {
+        run(process.execPath, ['--check', join(packageDir, file)]);
+      }
+    }
+
+    const optional = pkg.optionalDependencies ?? {};
     const slotAlias = `npm:@ohos-npm-ports/opentui-core-openharmony-arm64@${pkg.version}`;
-    if (opt["@opentui/core-openharmony-arm64"] !== slotAlias) {
-      console.error(`slot alias mismatch: ${opt["@opentui/core-openharmony-arm64"]}`);
-      process.exit(1);
+    assert.equal(optional['@opentui/core-openharmony-arm64'], slotAlias, 'slot alias mismatch');
+    for (const [name, range] of Object.entries(optional)) {
+      if (name !== '@opentui/core-openharmony-arm64') assert.equal(range, version, name);
     }
-    for (const [name, range] of Object.entries(opt)) {
-      if (name === "@opentui/core-openharmony-arm64") continue;
-      if (range !== base) { console.error(`${name} = ${range}, expected ${base}`); process.exit(1); }
+
+    for (const marker of ['openharmony: "libopentui.so"', '"@opentui/core-openharmony-arm64"']) {
+      assertChunkMarker('chunk-bun-', marker);
+      assertChunkMarker('chunk-node-', marker);
     }
-  ' "${version}"
+    assertChunkMarker('chunk-bun-', '#opentui/parser-worker');
+    assert.ok(readFileSync(join(packageDir, 'node-assets.js'), 'utf8').includes('openharmony: "libopentui.so"'));
 
-  # 标记断言针对 chunk 集合整体（bun splitting 会产出不含标记的共享块）
-  for marker in 'openharmony: "libopentui.so"' '"@opentui/core-openharmony-arm64"'; do
-    grep -qF "$marker" chunk-bun-*.js
-    grep -qF "$marker" chunk-node-*.js
-  done
-  grep -qF '#opentui/parser-worker' chunk-bun-*.js
-  grep -qF 'openharmony: "libopentui.so"' node-assets.js
-
-  # npm alias override 会令裸名 @opentui/core 自引用无法解析
-  if grep -rnE '(from|import\(|require\()"@opentui/core["/]' --include='*.js' .; then
-    echo "Bare @opentui/core self-import found (breaks npm alias override resolution)" >&2
-    exit 1
-  fi
-
-  # --- e2e 冒烟脚手架：临时槽位（真实 native、与槽位 port 同源） ---
-  cd "${root_dir}/${source_dir}/packages/native"
-  sh scripts/prepare-zig-deps.sh
-  zig build -Dlibrary-target="${ohos_triple}" -Doptimize=ReleaseFast
-  [ -f "${root_dir}/${native_lib}" ] || {
-    echo "no libopentui.so under lib/${ohos_triple}" >&2
-    exit 1
+    const selfImport = /(from|import\(|require\()"@opentui\/core["/]/;
+    for (const file of listFiles(packageDir)) {
+      if (file.endsWith('.js')) assert.ok(!selfImport.test(readFileSync(join(packageDir, file), 'utf8')), `Bare @opentui/core self-import: ${file}`);
+    }
   }
-  python3 -c "import ctypes; ctypes.CDLL('${root_dir}/${native_lib}'); print('dlopen OK')"
 
-  slot_name="${root_dir}/smoke-slot"
-  mkdir -p "$slot_name"
-  cd "$slot_name"
-  cat >index.js <<'EOF'
-import { fileURLToPath } from "node:url"
+  slot_openharmony_arm64_prepare() {
+    delete process.env.LD_PRELOAD;
+    configureOhos(slotRootDir, true);
+    fetchResource('upstream', join(slotRootDir, `opentui-${version}.tar.gz`));
+    run('tar', ['-zxf', `opentui-${version}.tar.gz`], { cwd: slotRootDir });
+    rmSync(join(slotRootDir, `opentui-${version}.tar.gz`));
+  }
 
-export default fileURLToPath(new URL("./libopentui.so", import.meta.url))
-EOF
-  cat >index.bun.js <<'EOF'
-const module = await import("./libopentui.so", { with: { type: "file" } })
-
-export default module.default
-EOF
-  cat >index.d.ts <<'EOF'
-declare const path: string
-export default path
-EOF
-  cat >package.json <<EOF
-{
-  "name": "@ohos-npm-ports/opentui-core-openharmony-arm64",
-  "version": "${version}",
-  "description": "Prebuilt openharmony-arm64 binaries for @opentui/core",
-  "type": "module",
-  "main": "index.js",
-  "module": "index.js",
-  "types": "index.d.ts",
-  "license": "MIT",
-  "exports": {
-    ".": {
-      "bun": "./index.bun.js",
-      "import": "./index.js",
-      "types": "./index.d.ts"
+  slot_openharmony_arm64_build() {
+    cd(slotSourceDir);
+    for (const patch of ['0003-ohos-weak-pthread-tryjoin.patch', '0005-ohos-zig-target.patch']) {
+      run('patch', ['-p1'], { input: readFileSync(join(slotRootDir, 'patches', patch)) });
     }
-  },
-  "os": ["openharmony"],
-  "cpu": ["arm64"]
-}
-EOF
-  cp "${root_dir}/${native_lib}" libopentui.so
-  cp "${root_dir}/${source_dir}/LICENSE" LICENSE
-  cd "${root_dir}/${source_dir}/packages/native/src/vendor"
-  cp wuffs/LICENSE "$slot_name/LICENSE-WUFFS"
-  cp stb/LICENSE "$slot_name/LICENSE-STB"
-  cp libwebp/COPYING "$slot_name/LICENSE-LIBWEBP"
-  cp libwebp/PATENTS "$slot_name/PATENTS-LIBWEBP"
-  cp libwebp/AUTHORS "$slot_name/AUTHORS-LIBWEBP"
-  cp lcms2/LICENSE "$slot_name/LICENSE-LCMS2"
-  cp "${root_dir}/${source_dir}/packages/core/THIRD_PARTY_LICENSES/GHOSTTY" "$slot_name/LICENSE-GHOSTTY"
+    assert.ok(readFileSync('packages/native/src/clipboard/host.zig', 'utf8').includes('linkage = .weak'));
+    assert.ok(readFileSync('packages/native/build.zig', 'utf8').includes('"aarch64-linux-ohos"'));
 
-  # --- e2e：bun 渲染 + compile 独立二进制（native 经消费方 bundler 内嵌）+ node import ---
-  app_dir="${root_dir}/smoke-app"
-  mkdir -p "${app_dir}/node_modules/@ohos-npm-ports" "${app_dir}/node_modules/@opentui"
-  cd "$app_dir"
-  printf '{"name":"smoke","version":"1.0.0"}\n' >package.json
-  bun add web-tree-sitter@0.25.10
-  cp -r "${root_dir}/${package_dir}" node_modules/@ohos-npm-ports/opentui-core
-  cp -r "$slot_name" node_modules/@opentui/core-openharmony-arm64
+    const nativeDir = join(slotSourceDir, 'packages/native');
+    run('sh', ['scripts/prepare-zig-deps.sh'], { cwd: nativeDir });
+    run('zig', ['build', `-Dlibrary-target=${ohosTriple}`, '-Doptimize=ReleaseFast'], { cwd: nativeDir });
+    assert.ok(existsSync(slotNativeLib) && statSync(slotNativeLib).isFile(), `no libopentui.so under lib/${ohosTriple}`);
+  }
 
-  cat >app.mjs <<'EOF'
-import { createTestRenderer } from "@ohos-npm-ports/opentui-core/testing"
-import { BoxRenderable } from "@ohos-npm-ports/opentui-core"
+  slot_openharmony_arm64_package() {
+    const llvmStrip = join(run('brew', ['--prefix', 'llvm@22'], { capture: true }).stdout.trim(), 'bin/llvm-strip');
+    run(llvmStrip, ['--strip-all', slotNativeLib]);
+    mkdirSync(slotPackageDir, { recursive: true });
+    writeSlotPackage();
+
+    const pkg = readJson(join(slotPackageDir, 'package.json'));
+    assert.deepEqual(pkg.os, ['openharmony']);
+    assert.deepEqual(pkg.cpu, ['arm64']);
+    run('python3', [
+      '-c', "import ctypes, sys; ctypes.CDLL(sys.argv[1]); print('dlopen OK')", join(slotPackageDir, 'libopentui.so'),
+    ]);
+    console.log(`OK: @ohos-npm-ports/opentui-core-openharmony-arm64 ${version} packed with source-built core`);
+  }
+
+  static testPlatforms = ['openharmony'];
+  static testPlatformReason = 'Requires the OpenHarmony native slot and Bun compile runtime.';
+
+  testSetup() {
+    run('brew', ['install', 'bun']);
+    const { projectDir } = recipeContext();
+    const file = join(projectDir, 'package.json');
+    const pkg = readJson(file);
+    pkg.dependencies ??= {};
+    pkg.dependencies['web-tree-sitter'] = '0.25.10';
+    writeJson(file, pkg);
+  }
+
+  test() {
+    const { projectDir } = recipeContext();
+    writeFileSync(join(projectDir, 'app.mjs'), `import { createTestRenderer } from "@opentui/core/testing"
+import { BoxRenderable } from "@opentui/core"
 
 const setup = await createTestRenderer({ width: 30, height: 10 })
 const box = new BoxRenderable(setup.renderer, { width: 10, height: 3, border: true, title: "ohos" })
@@ -241,161 +279,20 @@ const frame = setup.captureCharFrame()
 if (!frame.includes("ohos")) throw new Error("frame missing box title")
 console.log("SMOKE-OK bun-render")
 await setup.renderer.destroy()
-EOF
-  bun app.mjs
+`);
+    run('bun', ['app.mjs'], { cwd: projectDir });
+    run('bun', ['build', '--compile', 'app.mjs', '--outfile', 'smoke-bin'], { cwd: projectDir });
+    const isolatedDir = join(projectDir, 'isolated');
+    mkdirSync(isolatedDir, { recursive: true });
+    cpSync(join(projectDir, 'smoke-bin'), join(isolatedDir, 'smoke-bin'));
+    run(join(isolatedDir, 'smoke-bin'), [], { cwd: isolatedDir });
 
-  bun build --compile app.mjs --outfile smoke-bin
-  mkdir isolated
-  cp smoke-bin isolated/
-  cd isolated
-  ./smoke-bin
-
-  cd "$app_dir"
-  node -e 'import("@ohos-npm-ports/opentui-core").then(() => console.log("SMOKE-OK node-import"))'
-
-  echo "OK: @ohos-npm-ports/opentui-core ${version} rebuilt from source (slot: openharmony-arm64)"
-}
-
-slot_openharmony_arm64_prepare() {
-  # 源码构建 libopentui.so（zig aarch64-linux-ohos），OHOS libc 无 pthread_tryjoin_np，
-  # 0003 以 weak 符号回退（缺符号解析为 null 走回退路径）。
-  # 消费方以 optionalDependencies alias 安装到上游槽位名
-  # @opentui/core-openharmony-arm64：父包解析分支按上游平台包命名约定引用本包；
-  # bun --compile 时消费方 bundler 经本包 index.bun.js 的字面量 file-import 内嵌 .so。
-  # index.* 模板与上游 packages/core/scripts/build.ts --native 的平台包产物逐字一致。
-  # 分区同构 brew 内部流水线：deps → fetch → build → package → test。
-
-  # ============================== 声明 ==============================
-
-  unset LD_PRELOAD
-  pkgname=opentui-core-openharmony-arm64
-  root_dir="$(pwd)"
-  port_dir="$NPMBUILD_SLOT_DIR"
-  source_dir="opentui-${version}"
-  package_dir="${pkgname}-${version}"
-  ohos_triple=aarch64-linux-ohos
-  native_lib="${source_dir}/packages/native/lib/${ohos_triple}/libopentui.so"
-
-  # ============================== deps ==============================
-  brew list --versions ohos-sdk-native >/dev/null 2>&1 || brew install -y ohos-sdk-native
-  brew install ohos-sdk-toolchains
-  brew install zig@0.17
-  zig version
-  export ZIG_GLOBAL_CACHE_DIR="${root_dir}/zig-cache"
-
-  ohos_sdk=$(brew --prefix ohos-sdk-native)
-  ohos_sysroot="${ohos_sdk}/sysroot"
-  ohos_clang_runtime=
-  for candidate in "${ohos_sdk}"/llvm/lib/clang/*/lib/"${ohos_triple}"; do
-    [ -d "$candidate" ] && ohos_clang_runtime="$candidate"
-  done
-  [ -d "${ohos_sysroot}/usr/lib/${ohos_triple}" ] || {
-    echo "OHOS sysroot is missing ${ohos_triple} libraries" >&2
-    exit 1
+    writeFileSync(join(projectDir, 'node-import.mjs'), 'import "@opentui/core";\nconsole.log("SMOKE-OK node-import");\n');
+    run(process.execPath, ['node-import.mjs'], { cwd: projectDir });
+    console.log(`OK: @ohos-npm-ports/opentui-core ${version} rebuilt from source (slot: openharmony-arm64)`);
+    return {
+      result: { bunRender: true, bunCompile: true, nodeImport: true },
+      assets: [],
+    };
   }
-  [ -n "$ohos_clang_runtime" ] || {
-    echo "OHOS Clang runtime is missing for ${ohos_triple}" >&2
-    exit 1
-  }
-  export ZIG_LIBC="${root_dir}/ohos-libc.txt"
-  cat >"$ZIG_LIBC" <<EOF
-include_dir=${ohos_sysroot}/usr/include
-sys_include_dir=${ohos_sysroot}/usr/include/${ohos_triple}
-crt_dir=${ohos_sysroot}/usr/lib/${ohos_triple}
-msvc_lib_dir=
-kernel32_lib_dir=
-darwin_sdk_dir=
-cc_dir=${ohos_clang_runtime}
-EOF
-
-  fetch_resource "upstream" "${source_dir}.tar.gz"
-  tar -zxf "${source_dir}.tar.gz"
-  rm "${source_dir}.tar.gz"
-}
-
-slot_openharmony_arm64_build() {
-  cd "${root_dir}/${source_dir}"
-  patch -p1 <"${port_dir}/patches/0003-ohos-weak-pthread-tryjoin.patch"
-  patch -p1 <"${port_dir}/patches/0005-ohos-zig-target.patch"
-  # toybox patch 对错 header 静默 no-op，打完必须 grep marker
-  grep -q 'linkage = .weak' packages/native/src/clipboard/host.zig
-  grep -q '"aarch64-linux-ohos"' packages/native/build.zig
-
-  cd "${root_dir}/${source_dir}/packages/native"
-  sh scripts/prepare-zig-deps.sh
-  zig build -Dlibrary-target="${ohos_triple}" -Doptimize=ReleaseFast
-  [ -f "${root_dir}/${native_lib}" ] || {
-    echo "no libopentui.so under lib/${ohos_triple}" >&2
-    exit 1
-  }
-}
-
-slot_openharmony_arm64_package() {
-  # 随包发布给用户的 .so：llvm-strip（dlopen 库无需 +x）
-  llvm_strip="$(brew --prefix llvm@22)/bin/llvm-strip"
-  "$llvm_strip" --strip-all "${root_dir}/${native_lib}"
-
-  mkdir -p "${root_dir}/${package_dir}"
-  cd "${root_dir}/${package_dir}"
-  cat >index.js <<'EOF'
-import { fileURLToPath } from "node:url"
-
-export default fileURLToPath(new URL("./libopentui.so", import.meta.url))
-EOF
-  cat >index.bun.js <<'EOF'
-const module = await import("./libopentui.so", { with: { type: "file" } })
-
-export default module.default
-EOF
-  cat >index.d.ts <<'EOF'
-declare const path: string
-export default path
-EOF
-  cat >package.json <<EOF
-{
-  "version": "${version}",
-  "description": "Prebuilt openharmony-arm64 binaries for @opentui/core",
-  "type": "module",
-  "main": "index.js",
-  "module": "index.js",
-  "types": "index.d.ts",
-  "license": "MIT",
-  "author": "OpenTUI Contributors",
-  "exports": {
-    ".": {
-      "bun": "./index.bun.js",
-      "import": "./index.js",
-      "types": "./index.d.ts"
-    }
-  },
-  "os": ["openharmony"],
-  "cpu": ["arm64"]
-}
-EOF
-  cp "${root_dir}/${native_lib}" libopentui.so
-  cp "${root_dir}/${source_dir}/LICENSE" LICENSE
-  cd "${root_dir}/${source_dir}/packages/native/src/vendor"
-  cp wuffs/LICENSE "${root_dir}/${package_dir}/LICENSE-WUFFS"
-  cp stb/LICENSE "${root_dir}/${package_dir}/LICENSE-STB"
-  cp libwebp/COPYING "${root_dir}/${package_dir}/LICENSE-LIBWEBP"
-  cp libwebp/PATENTS "${root_dir}/${package_dir}/PATENTS-LIBWEBP"
-  cp libwebp/AUTHORS "${root_dir}/${package_dir}/AUTHORS-LIBWEBP"
-  cp lcms2/LICENSE "${root_dir}/${package_dir}/LICENSE-LCMS2"
-  cp "${root_dir}/${source_dir}/packages/core/THIRD_PARTY_LICENSES/GHOSTTY" \
-    "${root_dir}/${package_dir}/LICENSE-GHOSTTY"
-}
-
-slot_openharmony_arm64_check() {
-  cd "${root_dir}/${package_dir}"
-  actual_name=$(node -e "console.log(require('./package.json').name)")
-  [ "$actual_name" = "@ohos-npm-ports/${pkgname}" ]
-  node -e '
-    const pkg = require("./package.json");
-    if (pkg.os[0] !== "openharmony" || pkg.cpu[0] !== "arm64") {
-      console.error("os/cpu filter wrong"); process.exit(1);
-    }
-  '
-  python3 -c "import ctypes; ctypes.CDLL('./libopentui.so'); print('dlopen OK')"
-
-  echo "OK: @ohos-npm-ports/${pkgname} ${version} packed with source-built core"
 }

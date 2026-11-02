@@ -4,6 +4,7 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverPorts, loadPort } from '../../cli/port.mjs';
 import { publishedIntegrity } from '../../cli/registry.mjs';
+import { buildInputsEqual } from './recipe-inputs.mjs';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const excluded = JSON.parse(readFileSync(join(repo, '.github/fixtures/consumer/excluded-ports.json'), 'utf8'));
@@ -27,35 +28,23 @@ const portDirPattern = /^ports\/[a-z0-9]\/[^/]+$/;
 
 export function testSpec(portDir) {
   assert.match(portDir, portDirPattern);
-  const file = join(repo, portDir, 'test.js');
-  if (!existsSync(file)) return null;
-  const source = readFileSync(file, 'utf8');
-  const field = (name) => source.match(new RegExp(`^// @test-${name}: ([^\\r\\n]+)$`, 'm'))?.[1];
-  const upstream = field('package');
-  assert.ok(upstream, `Missing @test-package: ${file}`);
+  const definition = port(portDir).test;
+  if (!definition) return null;
+  const file = join(repo, portDir, 'NPMBUILD');
+  const { upstream, upstreamVersion, portPackage, project, fixture: localFixture, prerequisites, platforms, platformReason, role, timeout: timeoutMs, browser, setup } = definition;
   assert.match(upstream, /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/);
-  if (field('browser')) assert.equal(field('browser'), 'chromium', `Invalid browser: ${file}`);
-  if (field('setup')) assert.ok(['true', 'false'].includes(field('setup')), `Invalid setup flag: ${file}`);
-  const format = field('format') ?? 'esm';
-  assert.ok(['esm', 'cjs'].includes(format), `Invalid test format: ${file}`);
-  const role = field('role') ?? 'primary';
+  if (browser) assert.equal(browser, 'chromium', `Invalid browser: ${file}`);
   assert.ok(['primary', 'support'].includes(role), `Invalid test role: ${file}`);
-  const timeout = Number(field('timeout') ?? 600);
-  assert.ok(Number.isInteger(timeout) && timeout > 0 && timeout <= 1800, `Invalid test timeout: ${file}`);
-  const project = field('project') ?? 'node';
+  assert.ok(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 1_800_000, `Invalid test timeout: ${file}`);
   assert.match(project, /^[a-z0-9-]+$/);
-  const localFixture = field('fixture');
   if (localFixture) assert.match(localFixture, /^(?:[a-z0-9_-]+\/)*[a-z0-9_-]+$/);
   const fixture = localFixture ? join(repo, portDir, localFixture) : join(repo, '.github/fixtures/consumer/projects', project);
   assert.ok(existsSync(join(fixture, 'package.json')), `Missing consumer fixture: ${fixture}`);
-  const prerequisites = [...source.matchAll(/^\/\/ @test-prerequisite: (ports\/[a-z0-9]\/[^/\r\n]+)$/gm)].map((match) => match[1]);
-  const platforms = (field('platforms') ?? 'win32,linux,darwin,openharmony').split(',');
-  if (platforms.length < 4) assert.ok(field('platform-reason'), `Explain the restricted test platforms: ${file}`);
+  if (platforms.length < 4) assert.ok(platformReason, `Explain the restricted test platforms: ${file}`);
   return {
-    portDir, file, upstream, version: field('upstream-version') ?? port(portDir).version,
+    portDir, file, upstream, version: upstreamVersion,
     portVersion: port(portDir).portVersion,
-    portPackage: field('port-package') ?? `@ohos-npm-ports/${port(portDir).pkgname}`,
-    setup: field('setup') === 'true', format, role, timeout, browser: field('browser'), project, fixture, prerequisites, platforms, reason: field('platform-reason'),
+    portPackage, setup, role, timeout: timeoutMs / 1000, browser, project, fixture, prerequisites, platforms, reason: platformReason,
   };
 }
 
@@ -80,7 +69,7 @@ function allPortDirs() {
 }
 
 function allTests() {
-  return allPortDirs().filter((dir) => !isExcluded(dir) && existsSync(join(repo, dir, 'test.js')) && testSpec(dir).role === 'primary');
+  return allPortDirs().filter((dir) => !isExcluded(dir) && testSpec(dir)?.role === 'primary');
 }
 
 export function artifactPattern(port) {
@@ -130,7 +119,13 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const matrix = [...new Set([...dirs, ...expanded])].sort();
   // The matrix lists every port that needs tarballs; build-matrix is the part that must be built, the rest is
   // fetched from npm. Without REGISTRY_CHECK nothing is known about npm, so everything is built.
-  const sourceChanged = (dir) => changed.some((file) => file.startsWith(`${dir}/`) && file !== `${dir}/test.js`);
+  const sourceChanged = (dir) => {
+    const files = changed.filter((file) => file.startsWith(`${dir}/`) && file !== `${dir}/test.js` && file !== `${dir}/README.md`);
+    if (files.length === 0) return false;
+    if (files.some((file) => file !== `${dir}/NPMBUILD`)) return true;
+    if (!process.env.BASE) return true;
+    return !buildInputsEqual(process.env.BASE, 'HEAD', dir);
+  };
   const buildAll = process.env.REGISTRY_CHECK !== 'true' || process.env.BUILD_ALL === 'true' || changed.some(isBuildInfrastructure);
   const missing = buildAll && process.env.PUBLISH_CHECK !== 'true' ? [] : missingFromRegistry(matrix);
   const buildMatrix = buildAll ? matrix : matrix.filter((dir) => sourceChanged(dir) || missing.includes(dir));

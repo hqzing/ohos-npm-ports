@@ -2,7 +2,7 @@
 # 消费侧冒烟：双包各自 pack 成 tgz 装进干净工程，再从主包 loader 的解析上下文
 # require.resolve 槽位包，断言解析到已安装的 .node。
 # 槽位包 main 是 OHOS 的 .node，其 dlopen 依赖 HarmonyOS 系统库，容器内不做加载验证
-# （真机验证不在 CI 范围）；ELF/接线断言由 NPMBUILD check() 覆盖。
+# （真机验证不在 CI 范围）；ELF/接线断言由 NPMBUILD package() 覆盖。
 # cwd = 槽位包目录（NPMBUILD packages 的第一个产物目录）。
 set -eu
 

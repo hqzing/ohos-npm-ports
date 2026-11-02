@@ -1,224 +1,234 @@
-#!/usr/bin/env bash
-pkgname="pnpm"
-upstream="pnpm"
-version="12.16.1"
-revision=1
-dist_tag="latest"
+#!/usr/bin/env node
+/*
+@ohos-npm-ports/pnpm 12.16.1
 
-packages=(
-  "@ohos-npm-ports/pnpm-exe.openharmony-arm64:build/pnpm-exe.openharmony-arm64"
-  "build/pnpm-wrapper-${version}"
-)
-slot_name="pnpm-exe.openharmony-arm64"
-work_dir="$NPMBUILD_DIR"
-build_dir="${work_dir}/build"
-source="https://github.com/pnpm/pnpm/archive/refs/tags/v${version}.tar.gz"
-sha256="baaffdb2671a414882d13379d978339a58a9e66fe099f1f00f05a47b6232322c"
-resource "npm" \
-  "https://registry.npmjs.org/pnpm/-/pnpm-${version}.tgz" \
-  "ca362a16f2e1c3cfa81d406f3242446179a0e4aea457ba3e9e6c39e6476aba65"
-resource "iana_time_zone" \
-  "https://static.crates.io/crates/iana-time-zone/iana-time-zone-0.1.65.crate" \
-  "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
+1. Download the pnpm source tag and upstream npm wrapper.
+2. Patch host platform reporting, vendor iana-time-zone with runtime dlopen,
+   and use the OpenHarmony temporary directory for store operation locks.
+3. Build and strip pnpm-cli with cargo.
+4. Put the binary in @ohos-npm-ports/pnpm-exe.openharmony-arm64.
+5. Repack the upstream wrapper with its native-binary.mjs OpenHarmony branch.
+*/
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { dirname, join, relative } from 'node:path';
+import { tmpdir } from 'node:os';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, writeJson, requirePackage, importPackage, recipeContext } from '../../../cli/recipe.mjs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
 
-prepare() {
-  # ============================================================
-  # ohos-npm-ports: @ohos-npm-ports/pnpm ${version}
-  #
-  # 构建方式：
-  #   1. 下载 pnpm v12.16.1 源码 tag + pnpm@12.16.1 npm 包
-  #   2. 源码打补丁：host 平台上报 openharmony、iana-time-zone 改运行时 dlopen
-  #   3. cargo 构建 pnpm-cli，strip
-  #   4. 槽位包 @ohos-npm-ports/pnpm-exe.openharmony-arm64 携带二进制
-  #   5. 主包 = 上游 npm wrapper 重打包 + native-binary.mjs
-  #      增加 openharmony 平台分支
-  # ============================================================
+const version = '12.16.1';
+const slotName = 'pnpm-exe.openharmony-arm64';
+const ianaTimeZoneSha256 = 'e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const sourceDir = join(buildDir, `pnpm-${version}`);
+const slotDir = join(buildDir, slotName);
+const mainDir = join(buildDir, `pnpm-wrapper-${version}`);
 
-  echo "=== deps: toolchain ==="
-  mkdir -p /data/storage/el2/base/cache /data/storage/el2/base/file
-  brew install -y cmake pkgconf
-  cargo --version
-
-  echo "=== fetch: sources ==="
-  rm -rf "${build_dir}"
-  mkdir -p "${build_dir}"
-  fetch_source "${build_dir}/pnpm-src.tar.gz"
-  fetch_resource "npm" "${build_dir}/pnpm-npm.tgz"
-  fetch_resource "iana_time_zone" "${build_dir}/iana-time-zone.crate"
-  tar -zxf "${build_dir}/pnpm-src.tar.gz" -C "${build_dir}"
-  mkdir -p "${build_dir}/wrapper"
-  tar -zxf "${build_dir}/pnpm-npm.tgz" -C "${build_dir}/wrapper"
-  # pristine-diff 基线：补丁只允许碰 package.json 和 native-binary.mjs
-  node -e '
-        const fs = require("fs"), crypto = require("crypto"), path = require("path");
-        const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-            e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]);
-        const hashes = {};
-        for (const f of walk(process.argv[1]).sort()) {
-            hashes[path.relative(process.argv[1], f)] =
-                crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
-        }
-        fs.writeFileSync(process.argv[2], JSON.stringify(hashes, null, 1));
-    ' "${build_dir}/wrapper/package" "${build_dir}/wrapper-pristine.json"
+function filesBelow(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const file = join(directory, entry.name);
+    return entry.isDirectory() ? filesBelow(file) : [file];
+  }).sort();
 }
 
-build() {
-  echo "=== build: patch + cargo ==="
-  source_dir="${build_dir}/pnpm-${version}"
-
-  rm -f "${source_dir}/.cargo/config.toml"
-
-  for p in "${work_dir}"/patches/0001-host-platform-openharmony.patch \
-    "${work_dir}"/patches/0002-iana-time-zone-vendor.patch \
-    "${work_dir}"/patches/0003-cargo-lock-iana-time-zone.patch \
-    "${work_dir}"/patches/0007-use-ohos-tempdir.patch; do
-    (cd "${source_dir}" && patch -p1 <"$p")
-  done
-  # iana-time-zone 运行时 dlopen 改写：vendor 进源码树再打
-  mkdir -p "${source_dir}/vendor"
-  tar -zxf "${build_dir}/iana-time-zone.crate" -C "${source_dir}/vendor"
-  mv "${source_dir}/vendor/iana-time-zone-0.1.65" "${source_dir}/vendor/iana-time-zone"
-  (cd "${source_dir}" && patch -p1 <"${work_dir}/patches/0004-iana-time-zone-dlopen.patch")
-  # toybox patch 错 header 会静默 no-op，退出码不可信，grep marker 确认
-  grep -q 'openharmony' "${source_dir}/pnpm/crates/detect-libc/src/lib.rs"
-  grep -q 'iana-time-zone = { path' "${source_dir}/Cargo.toml"
-  ! grep -q "$resource_iana_time_zone_sha256" "${source_dir}/Cargo.lock"
-  grep -q 'dlopen' "${source_dir}/vendor/iana-time-zone/src/tz_ohos.rs"
-  # 0007: store 操作锁的根目录。pnpm 的 secure_user_lock_dir 在没有可用的
-  # XDG_RUNTIME_DIR 时会退回 /tmp（刻意不读 TMPDIR，让不同 TMPDIR 的进程
-  # 仍共享同一把锁），而 OHOS 的 /tmp 只读，于是 install 报
-  # ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK。
-  grep -q 'OHOS_TEMP_DIR: &str = "/data/storage/el2/base/cache"' \
-    "${source_dir}/pnpm/crates/fs/src/secure_temp_lock.rs"
-
-  # aws-lc-sys 构建 CPU Jitter RNG 需要 -O0，superenv 会把它优化掉
-  export AWS_LC_SYS_NO_JITTER_ENTROPY=1
-  (cd "${source_dir}" && cargo install --locked --path pnpm/crates/cli --root "${build_dir}/cargo-root")
-
-  bin_path="${build_dir}/cargo-root/bin/pnpm"
-  test -f "${bin_path}"
-  "${bin_path}" --version
-
-  llvm-strip --strip-all "${bin_path}" -o "${build_dir}/pnpm-bin"
-  chmod +x "${build_dir}/pnpm-bin"
+function hashTree(directory) {
+  return Object.fromEntries(filesBelow(directory).map((file) => [
+    relative(directory, file),
+    createHash('sha256').update(readFileSync(file)).digest('hex'),
+  ]));
 }
 
-package() {
-  echo "=== package: slot + main ==="
-  slot_dir="${build_dir}/${slot_name}"
-  rm -rf "${slot_dir}"
-  mkdir -p "${slot_dir}"
-  cp "${build_dir}/pnpm-bin" "${slot_dir}/pnpm"
-  chmod +x "${slot_dir}/pnpm"
-  cat >"${slot_dir}/package.json" <<EOF
-{
-  "version": "${version}",
-  "license": "MIT",
-  "os": ["openharmony"],
-  "cpu": ["arm64"],
-  "publishConfig": {
-    "executableFiles": ["./pnpm"]
+function verifyWrapper() {
+  const current = hashTree(mainDir);
+  const pristine = readJson(join(buildDir, 'wrapper-pristine.json'));
+  const allowed = new Set(['package.json', 'native-binary.mjs']);
+  for (const file of new Set([...Object.keys(pristine), ...Object.keys(current)])) {
+    assert.ok(pristine[file] === current[file] || allowed.has(file), `wrapper drift beyond patched files: ${file}`);
   }
 }
-EOF
 
-  main_dir="${build_dir}/pnpm-wrapper-${version}"
-  mv "${build_dir}/wrapper/package" "${main_dir}"
-  (cd "${main_dir}" && patch -p1 <"${work_dir}/patches/0005-update-package-json.patch")
-  (cd "${main_dir}" && patch -p1 <"${work_dir}/patches/0006-native-binary-openharmony.patch")
-  grep -qF '@ohos-npm-ports/pnpm-exe.openharmony-arm64/pnpm' "${main_dir}/native-binary.mjs"
-
-  # pristine-diff 不变量：组装产物与上游解包逐字节一致，
-  # 唯一允许改写的文件是两个 patch 的载体
-  node -e '
-        const fs = require("fs"), crypto = require("crypto"), path = require("path");
-        const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-            e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]);
-        const current = {};
-        for (const f of walk(process.argv[1]).sort()) {
-            current[path.relative(process.argv[1], f)] =
-                crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
-        }
-        const pristine = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-        const allowed = new Set(["package.json", "native-binary.mjs"]);
-        for (const k of new Set([...Object.keys(pristine), ...Object.keys(current)])) {
-            if (pristine[k] !== current[k] && !allowed.has(k)) {
-                throw new Error("wrapper drift beyond patched files: " + k);
-            }
-        }
-    ' "${main_dir}" "${build_dir}/wrapper-pristine.json"
+function verifyLoaderPlatforms() {
+  const script = `
+    Object.defineProperty(process, 'platform', { value: process.argv[1] });
+    const m = await import('./native-binary.mjs');
+    const candidates = m.getBinCandidates();
+    if (process.argv[1] === 'openharmony') {
+      if (candidates.length !== 1 || candidates[0] !== '@ohos-npm-ports/pnpm-exe.openharmony-arm64/pnpm')
+        throw new Error('openharmony: ' + JSON.stringify(candidates));
+    } else if (candidates.length === 0 || !candidates.every((name) => name.startsWith('@pnpm/exe.'))) {
+      throw new Error(process.argv[1] + ': ' + JSON.stringify(candidates));
+    }
+  `;
+  for (const platform of ['openharmony', 'linux', 'darwin', 'win32']) {
+    run(process.execPath, ['--input-type=module', '-e', script, platform], { cwd: mainDir });
+  }
 }
 
-check() {
-  echo "=== test: assertions ==="
-  main_dir="${build_dir}/pnpm-wrapper-${version}"
-  slot_dir="${build_dir}/${slot_name}"
+export default class Pnpm extends Port {
+  static pkgname = 'pnpm';
+  static upstream = 'pnpm';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [
+    '@ohos-npm-ports/pnpm-exe.openharmony-arm64:build/pnpm-exe.openharmony-arm64',
+    `build/pnpm-wrapper-${version}`,
+  ];
+  static source = `https://github.com/pnpm/pnpm/archive/refs/tags/v${version}.tar.gz`;
+  static sha256 = 'baaffdb2671a414882d13379d978339a58a9e66fe099f1f00f05a47b6232322c';
+  static resources = [
+    resource(
+      'npm',
+      `https://registry.npmjs.org/pnpm/-/pnpm-${version}.tgz`,
+      'ca362a16f2e1c3cfa81d406f3242446179a0e4aea457ba3e9e6c39e6476aba65',
+    ),
+    resource(
+      'iana_time_zone',
+      'https://static.crates.io/crates/iana-time-zone/iana-time-zone-0.1.65.crate',
+      ianaTimeZoneSha256,
+    ),
+  ];
 
-  # 包名/版本断言
-  node -e '
-        const p = require("'"${main_dir}"'/package.json");
-        const s = require("'"${slot_dir}"'/package.json");
-        if (p.name !== "@ohos-npm-ports/pnpm") throw new Error("main name: " + p.name);
-        if (p.version !== s.version) throw new Error("main version: " + p.version);
-        if (p.optionalDependencies["@ohos-npm-ports/'"${slot_name}"'"] !== s.version) throw new Error("slot ref missing");
-        if (s.name !== "@ohos-npm-ports/'"${slot_name}"'") throw new Error("slot name: " + s.name);
-        if (s.version !== p.version) throw new Error("slot version: " + s.version);
-        if (s.os[0] !== "openharmony" || s.cpu[0] !== "arm64") throw new Error("slot os/cpu");
-    '
+  prepare() {
+    console.log('=== deps: toolchain ===');
+    mkdirSync('/data/storage/el2/base/cache', { recursive: true });
+    mkdirSync('/data/storage/el2/base/file', { recursive: true });
+    run('brew', ['install', '-y', 'cmake', 'pkgconf']);
+    run('cargo', ['--version']);
 
-  # 二进制执行
-  "${slot_dir}/pnpm" --version
+    console.log('=== fetch: sources ===');
+    rmSync(buildDir, { recursive: true, force: true });
+    mkdirSync(buildDir, { recursive: true });
+    cd(buildDir);
+    fetchSource(join(buildDir, 'pnpm-src.tar.gz'));
+    fetchResource('npm', join(buildDir, 'pnpm-npm.tgz'));
+    fetchResource('iana_time_zone', join(buildDir, 'iana-time-zone.crate'));
+    run('tar', ['-zxf', join(buildDir, 'pnpm-src.tar.gz'), '-C', buildDir]);
+    mkdirSync(join(buildDir, 'wrapper'));
+    run('tar', ['-zxf', join(buildDir, 'pnpm-npm.tgz'), '-C', join(buildDir, 'wrapper')]);
+    writeJson(join(buildDir, 'wrapper-pristine.json'), hashTree(join(buildDir, 'wrapper/package')));
+  }
 
-  # loader 平台分支：openharmony 命中槽位，其他平台仍走上游包
-  (cd "${main_dir}" && node --input-type=module -e '
-        Object.defineProperty(process, "platform", { value: "openharmony" });
-        const m = await import("./native-binary.mjs");
-        const c = m.getBinCandidates();
-        if (c.length !== 1 || c[0] !== "@ohos-npm-ports/pnpm-exe.openharmony-arm64/pnpm") throw new Error("openharmony: " + JSON.stringify(c));
-    ')
-  for plat in linux darwin win32; do
-    (cd "${main_dir}" && node --input-type=module -e '
-            Object.defineProperty(process, "platform", { value: "'"$plat"'" });
-            const m = await import("./native-binary.mjs");
-            const c = m.getBinCandidates();
-            if (c.length === 0 || !c.every((s) => s.startsWith("@pnpm/exe."))) throw new Error("'"$plat"': " + JSON.stringify(c));
-        ')
-  done
+  build() {
+    console.log('=== build: patch + cargo ===');
+    rmSync(join(sourceDir, '.cargo/config.toml'), { force: true });
+    for (const patch of [
+      '0001-host-platform-openharmony.patch',
+      '0002-iana-time-zone-vendor.patch',
+      '0003-cargo-lock-iana-time-zone.patch',
+      '0007-use-ohos-tempdir.patch',
+    ]) {
+      run('patch', ['-p1'], { cwd: sourceDir, input: readFileSync(join(rootDir, 'patches', patch)) });
+    }
 
-  # 消费冒烟：双包 npm pack 后干净工程安装，跑 install.js 链接二进制并执行
-  smoke_dir="${build_dir}/smoke"
-  rm -rf "${smoke_dir}"
-  mkdir -p "${smoke_dir}/pkgs-slot" "${smoke_dir}/pkgs-main" "${smoke_dir}/proj"
-  npm pack "${slot_dir}" --pack-destination "${smoke_dir}/pkgs-slot" >/dev/null
-  npm pack "${main_dir}" --pack-destination "${smoke_dir}/pkgs-main" >/dev/null
-  slot_tgz=$(ls "${smoke_dir}/pkgs-slot/"*.tgz)
-  main_tgz=$(ls "${smoke_dir}/pkgs-main/"*.tgz)
-  cd "${smoke_dir}/proj"
-  echo '{"name":"smoke"}' >package.json
-  npm install --force --ignore-scripts "${slot_tgz}" "${main_tgz}" >/dev/null
-  cd node_modules/@ohos-npm-ports/pnpm
-  node install.js
-  test -x pnpm
-  head -c 4 pnpm | od -An -tx1 | grep -q '7f 45 4c 46'
-  ./pnpm --version
+    mkdirSync(join(sourceDir, 'vendor'), { recursive: true });
+    run('tar', ['-zxf', join(buildDir, 'iana-time-zone.crate'), '-C', join(sourceDir, 'vendor')]);
+    renameSync(join(sourceDir, 'vendor/iana-time-zone-0.1.65'), join(sourceDir, 'vendor/iana-time-zone'));
+    run('patch', ['-p1'], {
+      cwd: sourceDir,
+      input: readFileSync(join(rootDir, 'patches/0004-iana-time-zone-dlopen.patch')),
+    });
 
-  mkdir "${smoke_dir}/alias"
-  (
-    cd "${smoke_dir}/alias"
-    echo '{"name":"alias-smoke"}' >package.json
-    npm install --force --ignore-scripts "pnpm@file:${main_tgz}" "${slot_tgz}" >/dev/null
-    node node_modules/pnpm/install.js
-    test -x node_modules/pnpm/pnpm
-    ./node_modules/pnpm/pnpm --version
-  )
+    assert.ok(readFileSync(join(sourceDir, 'pnpm/crates/detect-libc/src/lib.rs'), 'utf8').includes('openharmony'));
+    assert.ok(readFileSync(join(sourceDir, 'Cargo.toml'), 'utf8').includes('iana-time-zone = { path'));
+    assert.ok(!readFileSync(join(sourceDir, 'Cargo.lock'), 'utf8').includes(ianaTimeZoneSha256));
+    assert.ok(readFileSync(join(sourceDir, 'vendor/iana-time-zone/src/tz_ohos.rs'), 'utf8').includes('dlopen'));
+    // OpenHarmony has a read-only /tmp; all processes must share this lock root
+    // even when XDG_RUNTIME_DIR is unavailable and TMPDIR differs.
+    assert.ok(readFileSync(join(sourceDir, 'pnpm/crates/fs/src/secure_temp_lock.rs'), 'utf8')
+      .includes('OHOS_TEMP_DIR: &str = "/data/storage/el2/base/cache"'));
 
-  # 真正跑一次 install：0007 修的锁目录问题只有执行才会暴露。
-  # 未打 0007 时这里报 ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK（/tmp 只读）。
-  (cd "${smoke_dir}/proj" && ./node_modules/@ohos-npm-ports/pnpm/pnpm install --lockfile-only)
+    run('cargo', ['install', '--locked', '--path', 'pnpm/crates/cli', '--root', join(buildDir, 'cargo-root')], {
+      cwd: sourceDir,
+      env: { AWS_LC_SYS_NO_JITTER_ENTROPY: '1' },
+    });
+    const binary = join(buildDir, 'cargo-root/bin/pnpm');
+    assert.ok(existsSync(binary));
+    run(binary, ['--version']);
+    run('llvm-strip', ['--strip-all', binary, '-o', join(buildDir, 'pnpm-bin')]);
+    chmodSync(join(buildDir, 'pnpm-bin'), 0o755);
+  }
 
-  # 两个目录必须与 NPMBUILD packages 一致，在构建期先断言产物存在
-  test -d "${work_dir}/build/${slot_name}"
-  test -d "${work_dir}/build/pnpm-wrapper-${version}"
+  package() {
+    console.log('=== package: slot + main ===');
+    rmSync(slotDir, { recursive: true, force: true });
+    mkdirSync(slotDir, { recursive: true });
+    copyFileSync(join(buildDir, 'pnpm-bin'), join(slotDir, 'pnpm'));
+    chmodSync(join(slotDir, 'pnpm'), 0o755);
+    writeJson(join(slotDir, 'package.json'), {
+      version,
+      license: 'MIT',
+      os: ['openharmony'],
+      cpu: ['arm64'],
+      publishConfig: { executableFiles: ['./pnpm'] },
+    });
 
-  echo "=== done: ${build_dir}/pnpm-wrapper-${version} + ${build_dir}/${slot_name} ==="
+    renameSync(join(buildDir, 'wrapper/package'), mainDir);
+    for (const patch of ['0005-update-package-json.patch', '0006-native-binary-openharmony.patch']) {
+      run('patch', ['-p1'], { cwd: mainDir, input: readFileSync(join(rootDir, 'patches', patch)) });
+    }
+    assert.ok(readFileSync(join(mainDir, 'native-binary.mjs'), 'utf8')
+      .includes('@ohos-npm-ports/pnpm-exe.openharmony-arm64/pnpm'));
+    verifyWrapper();
+
+    const mainPkg = readJson(join(mainDir, 'package.json'));
+    const slotPkg = readJson(join(slotDir, 'package.json'));
+    assert.equal(mainPkg.version, version);
+    assert.equal(slotPkg.version, mainPkg.version);
+    assert.equal(mainPkg.optionalDependencies[`@ohos-npm-ports/${slotName}`], slotPkg.version);
+    assert.deepEqual(slotPkg.os, ['openharmony']);
+    assert.deepEqual(slotPkg.cpu, ['arm64']);
+    run(join(slotDir, 'pnpm'), ['--version']);
+    assert.equal(readFileSync(join(slotDir, 'pnpm')).subarray(0, 4).toString('hex'), '7f454c46');
+    verifyLoaderPlatforms();
+    assert.ok(existsSync(slotDir));
+    assert.ok(existsSync(mainDir));
+  }
+
+  static testTimeout = 600_000;
+
+  async test() {
+    const context = recipeContext();
+    const pkg = requirePackage('pnpm/package.json');
+    if (context.mode === 'overrides') {
+      assert.equal(pkg.name, '@ohos-npm-ports/pnpm');
+      assert.equal(pkg.version, context.portVersion);
+      assert.equal(pkg.optionalDependencies[`@ohos-npm-ports/${slotName}`], context.portVersion);
+    } else {
+      assert.equal(pkg.name, 'pnpm');
+      assert.equal(pkg.version, version);
+    }
+
+    const native = await importPackage('pnpm/native-binary.mjs');
+    const candidates = native.getBinCandidates();
+    assert.ok(candidates.length > 0, 'no native binary candidate for the host');
+    const expectedPrefix = process.platform === 'openharmony' ? '@ohos-npm-ports/pnpm-exe.' : '@pnpm/exe.';
+    assert.ok(candidates.every((name) => name.startsWith(expectedPrefix)), JSON.stringify(candidates));
+    const installedBinary = native.resolveInstalledBinary();
+    assert.ok(installedBinary, 'installed native binary missing');
+    assert.ok(existsSync(installedBinary));
+
+    const root = dirname(context.resolvePackage('pnpm/package.json'));
+    const binary = join(root, process.platform === 'win32' ? 'pnpm.exe' : 'pnpm');
+    assert.ok(existsSync(binary));
+    if (process.platform === 'openharmony') {
+      assert.equal(readFileSync(binary).subarray(0, 4).toString('hex'), '7f454c46');
+    }
+    const output = run(binary, ['--version'], { capture: true }).stdout;
+    assert.ok(output.includes(version), output);
+
+    const smoke = mkdtempSync(join(tmpdir(), 'pnpm-port-'));
+    try {
+      writeJson(join(smoke, 'package.json'), { name: 'smoke' });
+      run(binary, ['install', '--lockfile-only'], { cwd: smoke });
+      assert.ok(existsSync(join(smoke, 'pnpm-lock.yaml')));
+    } finally {
+      rmSync(smoke, { recursive: true, force: true });
+    }
+    return {
+      result: { cliVersion: version, nativeLoader: true, lockfileOnlyInstall: true },
+      assets: [],
+    };
+  }
 }

@@ -1,85 +1,247 @@
-#!/usr/bin/env bash
-pkgname="nw"
-upstream="nw"
-version="0.119.2"
-revision=3
-source="https://registry.npmjs.org/nw/-/nw-${version}.tgz"
-sha256="702f94647266ac353e487c0420c01436e3eb23640e425e42ef00417d6de21495"
-dist_tag="latest"
+#!/usr/bin/env node
+/*
+# nw: experimental OpenHarmony local-browser backend
 
-packages=(
-  "build/nw-${version}"
-)
+This port preserves the upstream installer and runtime runner on Linux, macOS
+and Windows. On OpenHarmony it instead uses the **already installed Haitai
+browser**, a local `aa start --ps cmdArgs` invocation and loopback TCP CDP.
+It does not build or download another browser on OpenHarmony.
 
-work_dir="$NPMBUILD_DIR"
-build_dir="$work_dir/build"
-output_dir="$build_dir/nw-${version}"
+**This is a restricted compatibility bridge, not a native NW.js runtime or a
+transparent replacement for arbitrary NW.js applications.** Unsupported features
+must be removed from the application or reported as unsupported; they are not
+implemented as successful no-ops. `process.versions.nw` is intentionally absent.
 
-prepare() {
-  mkdir -p "$build_dir"
-  fetch_source "$build_dir/nw.tgz"
-  rm -rf "$output_dir"
-  mkdir -p "$output_dir"
-  tar -xzf "$build_dir/nw.tgz" -C "$output_dir" --strip-components=1
-  node - "$output_dir" "$build_dir/original.json" <<'JS'
-const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
-const root = process.argv[2];
-const hashes = {};
-function visit(dir) { for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-  const file = path.join(dir, item.name);
-  if (item.isDirectory()) visit(file);
-  else hashes[path.relative(root, file).split(path.sep).join('/')] = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-} }
-visit(root); fs.writeFileSync(process.argv[3], JSON.stringify(hashes));
-JS
+## Run
+
+```sh
+npm install -D nw@npm:@ohos-npm-ports/nw
+npx nw ./my-app -- argument-for-app
+```
+
+The app directory must contain a `package.json` with a local HTML `main`.
+`aa`, Node and Haitai must already be available. `NWJS_CDP_ENDPOINT` defaults to
+`http://127.0.0.1:9222`; only loopback HTTP endpoints with an explicit port are
+accepted. An already listening Haitai endpoint is reused. Otherwise the local
+ability is started with `cmdArgs` and the configured debug port. An unavailable
+endpoint is an error. The adapter never force-stops a browser to make flags work.
+Save and close an existing browser manually if it ignores new startup arguments.
+
+A separate browser context/page is created for the application. Closing the
+session closes that context and disconnects its CDP client, not the user's other
+browser windows. `run({ srcDir, argv, endpoint })` returns a session containing
+`page`, `context`, `close()` and `closed` on OpenHarmony, not a native child process.
+
+## Supported subset
+
+The current port supports the following features and constraints:
+
+- Local HTML/CSS/JS resources within the application directory.
+- Synchronous `require('fs')`, `require('path')`, `require('os')` and their `node:`
+  aliases; local JSON module imports. `nw.require` aliases the same function.
+- `fs.readFileSync` with explicit UTF-8 encoding (at most 1 MiB), text-only
+  `writeFileSync`, `existsSync`, `readdirSync` without options, `mkdirSync` with
+  optional `recursive`, and `unlinkSync`. File paths stay inside the app root.
+- Pure `path` basename/dirname/extname/isAbsolute/join/normalize/relative/resolve/
+  parse/format operations; `sep` and `delimiter`.
+- `os.platform/arch/type/release/endianness` and `EOL`.
+- `process.platform/arch/versions.node/argv/cwd()`, `__dirname`, `nw.process`.
+- `nw.App.argv/quit()` and current `nw.Window.get()` title/reload/close plus the
+  `loaded` event. Manifest `window.title` is accepted.
+- `nodejs: false` disables the page bridge and its capability endpoint.
+
+All synchronous host calls use synchronous same-origin HTTP requests. They
+block the renderer; this bridge is intended for small operations, not large
+files, streams, CPU-heavy work or requests that need the blocked page to execute
+more JavaScript. RPC request bodies are limited to 64 KiB.
+
+## Not supported
+
+Arbitrary JavaScript/CommonJS/ESM modules in `require`, third-party Node modules,
+Buffer/binary fs results, async fs, native addons, workers, child processes,
+DOM/Node object sharing, NW mixed contexts, menus, tray, native window styling,
+other window events, SDK/nwjc/NWBin and `.nw` archives are not supported.
+Manifest `node-main`, `node-remote`, injection scripts, `chromium-args`, remote
+`main` and window options other than `title` are rejected.
+
+`findpath()` explicitly fails on OpenHarmony because no standalone NW executable
+is installed. `get()` only checks the local backend's availability. Selecting a
+runtime version, SDK flavor or another target platform is not supported there.
+Other operating systems retain the upstream API implementations.
+
+## Trust and isolation
+
+Only run trusted local applications. This is not an OS sandbox. The server binds
+127.0.0.1, uses unpredictable resource paths, validates Host/Origin and a
+per-session capability token, exposes no wildcard CORS, checks resolved file
+paths and rejects symlink escapes. Capabilities are injected only into the
+application's top-level origin/path, never arbitrary remote navigations/frames.
+Local filesystem mutation races or a compromised local application are outside
+the security boundary. Public CDP access itself grants browser control; do not
+expose its port to the network.
+
+## Verification
+
+The NPMBUILD lifecycle validates the pinned npm source, preserves unaffected upstream file
+hashes, tests three desktop dispatch paths, validates the capability server and
+browser bootstrap, packs the artifact, installs it into a clean consumer and
+repeats the implementation tests from the installed package. The standard
+`test()` checks actual installs on the five consumer matrix targets without
+starting or downloading a browser. Browser downloads during consumer baseline
+installation are disabled in the temporary fixture only.
+
+The fixture in `tests/fixtures/app` is also used for HarmonyOS device validation:
+DOM, synchronous UTF-8 reads/writes, JSON import, platform/argv and `loaded` must
+work against the installed Haitai browser, with file output checked by Node.
+*/
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { Port, run, cd, fetchSource, readJson, requirePackage, importPackage, recipeContext } from '../../../cli/recipe.mjs';
+
+const version = '0.119.2';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const outputDir = join(buildDir, `nw-${version}`);
+const originalJson = join(buildDir, 'original.json');
+
+function hashDirectory(root) {
+  const hashes = {};
+  function visit(dir) {
+    for (const item of readdirSync(dir, { withFileTypes: true })) {
+      const file = join(dir, item.name);
+      if (item.isDirectory()) visit(file);
+      else hashes[relative(root, file).split(sep).join('/')] = createHash('sha256').update(readFileSync(file)).digest('hex');
+    }
+  }
+  visit(root);
+  return hashes;
 }
 
-build() {
-  cd "$output_dir"
-  patch -p1 <"$work_dir/patches/0001-local-browser-backend.patch"
-  grep -q 'openharmony' src/postinstall.js
-  grep -q 'ohos.run' src/index.js
+function runImplementationTests(root) {
+  run(process.execPath, [join(rootDir, 'tests/dispatch.cjs'), join(root, 'src/index.js')]);
+  for (const name of ['server', 'browser', 'endpoint']) {
+    run(process.execPath, [join(rootDir, `tests/${name}.cjs`)], {
+      env: { NW_TEST_IMPL: join(root, 'src/ohos') },
+    });
+  }
 }
 
-package() {
-  mkdir -p "$output_dir/src/ohos"
-  cp "$work_dir"/ohos/*.cjs "$output_dir/src/ohos/"
-  node - "$output_dir" "$build_dir/original.json" "${version}" <<'JS'
-const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto'), assert = require('node:assert/strict');
-const root = process.argv[2], hashes = JSON.parse(fs.readFileSync(process.argv[3]));
-const changed = new Set(['package.json', 'src/index.js', 'src/cli.js', 'src/postinstall.js']);
-for (const [file, hash] of Object.entries(hashes)) {
-  if (!changed.has(file)) assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex'), hash, file);
-}
-const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json')));
-assert.equal(pkg.version, process.argv[4]);
-assert.equal(pkg.dependencies['@ohos-npm-ports/playwright-core'], '1.62.1-5');
-for (const file of ['runtime.cjs', 'server.cjs', 'browser.cjs']) assert.ok(fs.existsSync(path.join(root, 'src/ohos', file)));
-JS
-}
+export default class Nw extends Port {
+  static pkgname = 'nw';
+  static upstream = 'nw';
+  static version = version;
+  static revision = 3;
+  static distTag = 'latest';
+  static packages = [`build/nw-${version}`];
+  static source = `https://registry.npmjs.org/nw/-/nw-${version}.tgz`;
+  static sha256 = '702f94647266ac353e487c0420c01436e3eb23640e425e42ef00417d6de21495';
 
-check() {
-  cd "$output_dir"
-  npm install --ignore-scripts --omit=dev --no-audit --no-fund
-  node --check src/index.js
-  node --check src/cli.js
-  node --check src/postinstall.js
-  if [ "$(node -p process.platform)" = openharmony ]; then node src/postinstall.js; fi
-  node "$work_dir/tests/dispatch.cjs" "$output_dir/src/index.js"
-  for test_file in server browser endpoint; do
-    NW_TEST_IMPL="$output_dir/src/ohos" node "$work_dir/tests/$test_file.cjs"
-  done
-  node -e 'import("./src/index.js").then(api => { for (const name of ["get", "run", "findpath"]) if (typeof api[name] !== "function") throw Error(name); });'
-  node src/cli.js --help
-  package_version=$(node -p "require('./package.json').version")
-  npm pack --ignore-scripts --silent
-  rm -rf "$build_dir/consumer"
-  mkdir -p "$build_dir/consumer"
-  cd "$build_dir/consumer"
-  npm init -y >/dev/null
-  npm install --ignore-scripts --no-audit --no-fund "$output_dir/ohos-npm-ports-nw-${package_version}.tgz"
-  node -e 'import("@ohos-npm-ports/nw").then(api => { if (typeof api.run !== "function") throw Error("consumer entry"); });'
-  for test_file in server browser endpoint; do
-    NW_TEST_IMPL="$build_dir/consumer/node_modules/@ohos-npm-ports/nw/src/ohos" node "$work_dir/tests/$test_file.cjs"
-  done
+  prepare() {
+    mkdirSync(buildDir, { recursive: true });
+    fetchSource(join(buildDir, 'nw.tgz'));
+    rmSync(outputDir, { recursive: true, force: true });
+    mkdirSync(outputDir, { recursive: true });
+    run('tar', ['-xzf', join(buildDir, 'nw.tgz'), '-C', outputDir, '--strip-components=1']);
+    writeFileSync(originalJson, JSON.stringify(hashDirectory(outputDir)));
+  }
+
+  build() {
+    cd(outputDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-local-browser-backend.patch')) });
+    assert.ok(readFileSync(join(outputDir, 'src/postinstall.js'), 'utf8').includes('openharmony'));
+    assert.ok(readFileSync(join(outputDir, 'src/index.js'), 'utf8').includes('ohos.run'));
+  }
+
+  async package() {
+    mkdirSync(join(outputDir, 'src/ohos'), { recursive: true });
+    for (const file of readdirSync(join(rootDir, 'ohos'))) {
+      if (file.endsWith('.cjs')) cpSync(join(rootDir, 'ohos', file), join(outputDir, 'src/ohos', file));
+    }
+
+    const hashes = JSON.parse(readFileSync(originalJson, 'utf8'));
+    const changed = new Set(['package.json', 'src/index.js', 'src/cli.js', 'src/postinstall.js']);
+    for (const [file, hash] of Object.entries(hashes)) {
+      if (!changed.has(file)) {
+        assert.equal(createHash('sha256').update(readFileSync(join(outputDir, file))).digest('hex'), hash, file);
+      }
+    }
+    const pkg = readJson(join(outputDir, 'package.json'));
+    assert.equal(pkg.version, version);
+    assert.equal(pkg.dependencies['@ohos-npm-ports/playwright-core'], '1.62.1-5');
+    for (const file of ['runtime.cjs', 'server.cjs', 'browser.cjs']) {
+      assert.ok(existsSync(join(outputDir, 'src/ohos', file)));
+    }
+
+    run('npm', ['install', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], { cwd: outputDir });
+    for (const file of ['src/index.js', 'src/cli.js', 'src/postinstall.js']) {
+      run(process.execPath, ['--check', file], { cwd: outputDir });
+    }
+    if (process.platform === 'openharmony') run(process.execPath, ['src/postinstall.js'], { cwd: outputDir });
+    runImplementationTests(outputDir);
+    const api = await import(pathToFileURL(join(outputDir, 'src/index.js')).href);
+    for (const name of ['get', 'run', 'findpath']) assert.equal(typeof api[name], 'function');
+    run(process.execPath, ['src/cli.js', '--help'], { cwd: outputDir });
+  }
+
+  testSetup() {
+    writeFileSync('.npmrc', 'ignore-scripts=true\n');
+  }
+
+  async test() {
+    const { mode } = recipeContext();
+    const api = await importPackage('nw');
+    for (const name of ['get', 'run', 'findpath']) assert.equal(typeof api[name], 'function');
+    const root = dirname(recipeContext().resolvePackage('nw/package.json'));
+    const help = run(process.execPath, [join(root, 'src/cli.js'), '--help'], {
+      capture: true,
+      timeout: 30_000,
+    }).stdout;
+    assert.match(help, /nw/i);
+    if (process.platform === 'openharmony') await assert.rejects(api.findpath(), /No standalone/);
+    else assert.match(await api.findpath(), /nwjs-v0\.119\.2/);
+
+    if (mode === 'overrides') {
+      assert.equal(requirePackage('nw/package.json').name, '@ohos-npm-ports/nw');
+      const { createAppServer } = requirePackage('nw/src/ohos/server.cjs');
+      const dir = mkdtempSync(join(tmpdir(), 'nw-consumer-'));
+      writeFileSync(join(dir, 'package.json'), '{"main":"index.html"}');
+      writeFileSync(join(dir, 'index.html'), '<title>nw consumer</title>');
+      writeFileSync(join(dir, 'data.json'), '{"answer":42}');
+      let app;
+      try {
+        app = await createAppServer({ appDir: dir });
+        assert.equal((await fetch(app.entryURL)).status, 200);
+        const invoke = async (module, method, args) => {
+          const response = await fetch(`${app.baseURL}__rpc`, {
+            method: 'POST',
+            headers: {
+              Origin: app.origin,
+              'Content-Type': 'application/json',
+              'X-NW-Token': app.config.token,
+            },
+            body: JSON.stringify({ module, method, args }),
+          });
+          return response.json();
+        };
+        assert.deepEqual((await invoke('json', 'require', ['./data.json'])).value, { answer: 42 });
+        assert.equal((await invoke('os', 'platform', [])).value, process.platform);
+        assert.equal((await invoke('fs', 'readFileSync', ['../escape', 'utf8'])).ok, false);
+        const unauthorized = await fetch(`${app.baseURL}__rpc`, { method: 'POST', body: '{}' });
+        assert.equal(unauthorized.status, 403);
+      } finally {
+        await app?.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+      runImplementationTests(root);
+    }
+
+    return {
+      result: { exports: ['get', 'run', 'findpath'], help: true, platformAPI: true },
+      assets: [],
+    };
+  }
 }

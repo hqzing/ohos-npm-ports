@@ -9,7 +9,7 @@ import { signPackages } from './sign.mjs';
 
 export const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const portScope = '@ohos-npm-ports/';
-const runtime = fileURLToPath(new URL('./runtime.sh', import.meta.url));
+const lifecycleRunner = fileURLToPath(new URL('./recipe-lifecycle.mjs', import.meta.url));
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, { stdio: ['ignore', 'inherit', 'inherit'], ...options });
@@ -77,7 +77,6 @@ function buildEnvironment(port) {
     ...process.env,
     NPMBUILD_DIR: port.dir,
     NPM_PORTS_ROOT: port.root,
-    NPM_PORTS_RUNTIME: runtime,
   };
   try {
     const prefix = execFileSync('brew', ['--prefix', 'python'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
@@ -103,36 +102,19 @@ function components(port) {
 }
 
 function runHooks(port, component, phases) {
-  const hooks = phases.map((phase) => `${component.prefix}${phase}`);
-  const script = [
-    'set -e',
-    'source "$NPM_PORTS_RUNTIME"',
-    'source "$NPMBUILD_DIR/NPMBUILD"',
-    ...hooks.flatMap((hook) => {
-      if (hook.endsWith('normalize')) return ['"$NPM_PORTS_NODE" "$NPM_PORTS_NORMALIZE"'];
-      return [
-        `if declare -F ${hook} >/dev/null; then`,
-        ...(hook.endsWith('package') ? ['  cd "$NPMBUILD_SLOT_DIR"'] : []),
-        `  ${hook}`,
-        'fi',
-      ];
-    }),
-  ].join('\n');
   console.log(`==> ${port.relative}${component.name === 'main' ? '' : `/${component.name}`}: ${phases.join(' -> ')}`);
-  run('bash', ['-c', script], {
+  run(process.execPath, [lifecycleRunner, port.dir, component.name, component.directory, JSON.stringify(phases)], {
     cwd: component.directory,
     env: {
       ...buildEnvironment(port),
       NPMBUILD_SLOT: component.name,
       NPMBUILD_SLOT_DIR: component.directory,
-      NPM_PORTS_NODE: process.execPath,
-      NPM_PORTS_NORMALIZE: fileURLToPath(new URL('./normalize.mjs', import.meta.url)),
     },
   });
 }
 
-export function runLifecycle(port, through = 'check') {
-  const phases = ['prepare', 'build', 'package', 'check'];
+export function runLifecycle(port, through = 'package') {
+  const phases = ['prepare', 'build', 'package'];
   if (!phases.includes(through)) throw new Error(`Unknown lifecycle phase: ${through}`);
   const selected = phases.slice(0, phases.indexOf(through) + 1);
   if (selected.includes('package')) selected.splice(selected.indexOf('package') + 1, 0, 'normalize');
@@ -147,12 +129,8 @@ export function packagePort(port) {
   return runLifecycle(port, 'package');
 }
 
-export function checkPort(port) {
-  return runLifecycle(port, 'check');
-}
-
 export function packPort(root, port, { build = true, signer = signPackages } = {}) {
-  if (build) checkPort(port);
+  if (build) packagePort(port);
   const staged = normalizePackages(port);
   console.log(`Staged ${staged.map(({ pkg }) => `${pkg.name}@${pkg.version}`).join(', ')}`);
   signer(staged);

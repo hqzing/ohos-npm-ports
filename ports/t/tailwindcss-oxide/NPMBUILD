@@ -1,99 +1,83 @@
-#!/usr/bin/env bash
-pkgname="tailwindcss-oxide"
-upstream="@tailwindcss/oxide"
-version="4.3.3"
-revision=4
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { Port, run, shell, cd, fetchSource, readJson, requirePackage } from '../../../cli/recipe.mjs';
 
-packages=(
-  "@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64:src/crates/node/npm/openharmony-arm64"
-  "src/crates/node"
-)
-source="https://github.com/tailwindlabs/tailwindcss/archive/refs/tags/v${version}.tar.gz"
-sha256="e702ce2493505287e8f6cab2dd1e0c14f154e57c296854d4ded38bde5da2be6e"
-source_name=tailwindcss
+const version = '4.3.3';
+const rootDir = import.meta.dirname;
+const sourceDir = join(rootDir, 'src');
+const nodeDir = join(sourceDir, 'crates/node');
 
-build() {
-  # Native napi-rs build: this container's rustc host triple is already
-  # aarch64-unknown-linux-ohos, so `napi build --platform` recognizes
-  # openharmony as the host and produces a correctly-named binding directly —
-  # no cross-compile target/toolchain wrapper needed.
-  #
-  # Two npm packages come out of this port (mirrors upstream's own per-platform
-  # split for @tailwindcss/oxide, not a single bundled binary like lightningcss
-  # or opentui-core):
-  #   - @ohos-npm-ports/tailwindcss-oxide                       (the JS loader)
-  #   - @ohos-npm-ports/tailwindcss-oxide-openharmony-arm64      (the .node binary)
-  # The JS loader's optionalDependencies point at the real upstream
-  # @tailwindcss/oxide-* packages for every other platform, and at our own
-  # openharmony-arm64 package (pinned to a real version, not `workspace:*` —
-  # `npm stage publish` ships that literal string as-is, unlike `pnpm publish`
-  # which rewrites it).
+export default class TailwindcssOxide extends Port {
+  static pkgname = 'tailwindcss-oxide';
+  static upstream = '@tailwindcss/oxide';
+  static version = version;
+  static revision = 4;
+  static distTag = 'latest';
+  static packages = [
+    '@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64:src/crates/node/npm/openharmony-arm64',
+    'src/crates/node',
+  ];
+  static source = `https://github.com/tailwindlabs/tailwindcss/archive/refs/tags/v${version}.tar.gz`;
+  static sha256 = 'e702ce2493505287e8f6cab2dd1e0c14f154e57c296854d4ded38bde5da2be6e';
 
-  fetch_source tailwindcss.tar.gz
-  tar -zxf tailwindcss.tar.gz
-  rm tailwindcss.tar.gz
-  mv "${source_name}-${version}" src
-  cd src
+  build() {
+    // This native napi-rs build produces the JS loader and a separate OHOS
+    // binary package, mirroring upstream's per-platform package split. Other
+    // platforms retain their real upstream optionalDependencies.
+    const archive = join(rootDir, 'tailwindcss.tar.gz');
+    fetchSource(archive);
+    run('tar', ['-zxf', archive, '-C', rootDir]);
+    rmSync(archive);
+    rmSync(sourceDir, { recursive: true, force: true });
+    renameSync(join(rootDir, `tailwindcss-${version}`), sourceDir);
+    cd(sourceDir);
 
-  patch -p1 <../patches/0001-package-json.patch
-  patch -p1 <../patches/0002-add-openharmony-subpackage.patch
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-package-json.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0002-add-openharmony-subpackage.patch')) });
 
-  cd crates/node
-  npm install --ignore-scripts
+    cd(nodeDir);
+    run('npm', ['install', '--ignore-scripts']);
 
-  # @napi-rs/cli hardcodes a cross-toolchain linker path for this target based
-  # on $OHOS_SDK_PATH/$OHOS_SDK_NATIVE (assuming cross-compilation from a
-  # non-OHOS host). We're building natively, so cargo's own env-var override —
-  # which takes precedence over any config file napi-rs writes — just needs to
-  # point at this container's native cc.
-  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$(command -v cc)"
-  npm run build:platform
+    // Prefer cargo's native linker override over napi-rs's cross-toolchain path.
+    process.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER = shell('command -v cc', { capture: true }).stdout.trim();
+    run('npm', ['run', 'build:platform']);
 
-  # napi-rs generates the loader's require() paths from napi.packageName
-  # (@tailwindcss/oxide), but our openharmony subpackages are published under
-  # @ohos-npm-ports/. Patch the generated index.js so the loader finds our
-  # binaries instead of the non-existent upstream @tailwindcss/oxide-openharmony-*.
-  patch -p1 <../../../patches/0003-fix-openharmony-loader-require.patch
+    // The generated loader otherwise looks for non-existent upstream OHOS packages.
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0003-fix-openharmony-loader-require.patch')) });
+    assert.ok(
+      readFileSync('index.js', 'utf8').includes("require('@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64')"),
+      'loader still references upstream @tailwindcss/oxide-openharmony-arm64',
+    );
 
-  # Verify the loader now points at our @ohos-npm-ports/ subpackages.
-  grep -q "require('@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64')" index.js || {
-    echo "ERROR: loader still references upstream @tailwindcss/oxide-openharmony-arm64" >&2
-    exit 1
+    const nodeFile = 'npm/openharmony-arm64/tailwindcss-oxide.openharmony-arm64.node';
+    assert.ok(existsSync(nodeFile), `${nodeFile} is missing`);
+    run('llvm-strip', ['--strip-all', nodeFile]);
+    chmodSync(nodeFile, 0o755);
+
+    const main = readJson('package.json');
+    const sub = readJson('npm/openharmony-arm64/package.json');
+    assert.equal(
+      main.optionalDependencies['@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64'],
+      sub.version,
+      'openharmony optionalDependency pin differs from the subpackage version',
+    );
   }
 
-  node_file=npm/openharmony-arm64/tailwindcss-oxide.openharmony-arm64.node
-  test -f "$node_file"
-
-  llvm-strip --strip-all "$node_file"
-  chmod +x "$node_file"
-
-  # --- verify package contents ---
-
-  # The main package's optionalDependency on our own subpackage must match the
-  # subpackage's actual version (everything else pins the real upstream
-  # version, which doesn't change here).
-  node -e '
-  const main = require("./package.json");
-  const sub = require("./npm/openharmony-arm64/package.json");
-  const declared = main.optionalDependencies["@ohos-npm-ports/tailwindcss-oxide-openharmony-arm64"];
-  if (declared !== sub.version) {
-    console.error(`optionalDependencies pin ${declared} != subpackage version ${sub.version}`);
-    process.exit(1);
+  test() {
+    const { Scanner } = requirePackage('@tailwindcss/oxide');
+    const scanner = new Scanner({ sources: [] });
+    const candidates = scanner.scanFiles([
+      { content: '<div class="text-red-500 flex"></div>', extension: 'html' },
+    ]);
+    assert.ok(candidates.includes('text-red-500') && candidates.includes('flex'), `unexpected scan output: ${JSON.stringify(candidates)}`);
+    return {
+      result: {
+        textRed500: candidates.includes('text-red-500'),
+        flex: candidates.includes('flex'),
+      },
+      assets: [],
+    };
   }
-'
-
-  # Real functional smoke test: this container IS the target platform, so
-  # actually run a real class scan through the addon.
-  node -e '
-  const { Scanner } = require("./npm/openharmony-arm64/tailwindcss-oxide.openharmony-arm64.node");
-  const scanner = new Scanner({ sources: [] });
-  const candidates = scanner.scanFiles([
-    { content: "<div class=\"text-red-500 flex\"></div>", extension: "html" },
-  ]);
-  console.log("scanFiles() candidates:", candidates);
-  if (!candidates.includes("text-red-500") || !candidates.includes("flex")) {
-    throw new Error("unexpected scan output: " + JSON.stringify(candidates));
-  }
-'
 }

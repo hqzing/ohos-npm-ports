@@ -66,7 +66,7 @@ test('dependency closure includes every required artifact', () => {
 
 test('port metadata supplies versions and consumer test options', () => {
   assert.equal(testSpec('ports/n/nw').setup, true);
-  assert.equal(testSpec('ports/v/vite-plus').format, 'cjs');
+  assert.equal(testSpec('ports/v/vite-plus').role, 'primary');
   assert.equal(testSpec('ports/l/lightningcss@1.32').timeout, 600);
   assert.equal(testSpec('ports/l/lightningcss@1.32').project, 'node');
   assert.equal(testSpec('ports/l/lightningcss@1.32').version, '1.32.0');
@@ -82,11 +82,11 @@ test('debug selection is explicit and rejects non-primary roots', () => {
   assert.throws(() => execFileSync(process.execPath, ['.github/scripts/consumer-plan.mjs'], { input: '', env: { ...env, CONSUMER_SELECTION: '["ports/b/bufferutil"]' }, stdio: ['pipe', 'pipe', 'pipe'] }));
 });
 
-test('every declared test parses in its selected module format', () => {
+test('every declared test lives in a parseable class recipe', () => {
   for (const dir of directories) {
     const spec = testSpec(dir);
     if (!spec) continue;
-    execFileSync(process.execPath, ['--input-type', spec.format === 'esm' ? 'module' : 'commonjs', '--check'], { input: readFileSync(spec.file), stdio: ['pipe', 'pipe', 'pipe'] });
+    execFileSync(process.execPath, ['--check', spec.file], { stdio: ['pipe', 'pipe', 'pipe'] });
   }
 });
 
@@ -205,7 +205,7 @@ test('editing only test infrastructure rebuilds nothing: the sentinels are teste
 });
 
 test('build infrastructure rebuilds the sentinels only', () => {
-  for (const file of ['.github/workflows/ci.yml', 'cli/build.mjs', 'cli/port.mjs', 'cli/runtime.sh', 'cli/sign.mjs', 'cli/semver.mjs', 'cli/npm-ports', 'cli/validate-publish.mjs', '.github/scripts/tool-versions.json']) {
+  for (const file of ['.github/workflows/ci.yml', 'cli/build.mjs', 'cli/port.mjs', 'cli/recipe.mjs', 'cli/sign.mjs', 'cli/semver.mjs', 'cli/npm-ports', 'cli/validate-publish.mjs', '.github/scripts/tool-versions.json']) {
     const { build, fetch } = split(file);
     same(build, sentinels);
     assert.deepEqual(fetch, [], file);

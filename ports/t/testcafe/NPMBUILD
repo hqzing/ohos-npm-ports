@@ -1,77 +1,168 @@
-#!/usr/bin/env bash
-pkgname="testcafe"
-upstream="testcafe"
-version="3.7.7"
-revision=1
-source="https://registry.npmjs.org/testcafe/-/testcafe-${version}.tgz"
-sha256="d439a391e21a8b8d529481cbbec848b6182096e56382dbd4d394680bab9886f4"
-dist_tag="latest"
+#!/usr/bin/env node
+/*
+# TestCafe on OpenHarmony
 
-packages=(
-  "testcafe-${version}"
-)
+This port preserves upstream behavior on other platforms. On OpenHarmony, the `chrome`, `chromium`, `haitai`, and `ohos` aliases use Haitai through local `aa` and TCP CDP. No hdc or Playwright dependency is required.
 
-export npm_config_registry=https://registry.npmjs.org
+```json
+{"devDependencies":{"testcafe":"npm:@ohos-npm-ports/testcafe"}}
+```
 
-work_dir="$NPMBUILD_DIR"
-build_dir="$work_dir/.build"
-package_dir="$work_dir/testcafe-${version}"
-export OPENSSL_CONF=/dev/null
+```sh
+npx testcafe chrome tests
+```
 
-prepare() {
-  mkdir -p "$build_dir"
-  fetch_source "$build_dir/upstream.tgz"
-  rm -rf "$build_dir/package"
-  tar -xzf "$build_dir/upstream.tgz" -C "$build_dir"
-  node - "$build_dir/package" "$build_dir/upstream-hashes.json" <<'JS'
-const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-const root=process.argv[2],hashes={};
-function walk(dir){for(const item of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,item.name);if(item.isDirectory())walk(p);else hashes[path.relative(root,p)]=crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');}}
-walk(root);fs.writeFileSync(process.argv[3],JSON.stringify(hashes));
-JS
+Haitai must be installed. If an existing browser was started without remote debugging or without popup support, close it manually before the first test run. The launcher does not terminate user sessions. `HARMONY_DEBUG_PORT` selects an explicit loopback CDP port; otherwise a validated endpoint cache is reused or aa starts a browser on an available port.
+
+Each connection owns an isolated browser context. Input, assertions, uploads, frames, dialogs, cookies, localStorage, navigation, and window switching use TestCafe's proxy automation. CDP provides tab lifecycle, foreground activation, PNG capture, and real window bounds control. Window size/state is restored before context disposal when the relevant window still exists. Context disposal also removes child windows left open by a test.
+
+Viewport/full-page/element screenshots and PNG thumbnails are supported. Set `TESTCAFE_DOWNLOAD_DIR` to a dedicated absolute directory to save attachment downloads without a prompt. The provider streams the actual browser response through CDP into the CLI filesystem, because browser-side native download saving can be canceled on HarmonyOS. It does not refetch the URL or change the settings of user browser contexts.
+
+Native Automation, headless mode, video recording, and browsers other than Haitai are not implemented by this backend. It keeps the active test tab in the foreground; parallel foreground-driven sessions are not validated. Pure JavaScript code is added; upstream authorship and license remain intact.
+
+The NPMBUILD lifecycle verifies the pinned upstream archive and permitted file-change set. The installed-package `test()` runs the baseline/override consumer contract, unit/platform-routing tests, and CLI checks. Physical-device browser verification is additional evidence, not a capability of the build container.
+
+## Device regression
+
+Copy `tests/device/` into an otherwise empty project, create `logs/`, and install the packed artifact under the upstream name (`npm install testcafe@file:/absolute/path/to/artifact.tgz`). From that project:
+
+```sh
+TESTCAFE_CHECK_THUMBNAILS=1 TESTCAFE_DOWNLOAD_DIR="$PWD/logs/downloads" node run.mjs --auto-native --suite=provider-screenshot
+TESTCAFE_DOWNLOAD_DIR="$PWD/logs/downloads" node run.mjs --auto-native --suite=download
+```
+
+Other suites are `smoke`, `extended`, `windows`, `window-screenshot`, `provider-window`, `typescript`, and `leaked-window`. `negative --failure-screenshots` deliberately fails one assertion and succeeds only when exactly one test fails and an actual screenshot is produced. `--auto-native` omits an explicit disableNativeAutomation setting, checking that the backend selects proxy mode automatically. The scripts keep and activate their test window, so run them serially.
+
+Adapter diagnostics are silent by default; set `TESTCAFE_OHOS_DEBUG=1` to send them to stderr without contaminating JSON reporter stdout.
+*/
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { delimiter, dirname, join, relative } from 'node:path';
+import { Port, run, cd, fetchSource, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
+
+const version = '3.7.7';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, '.build');
+const sourceDir = join(buildDir, 'package');
+const packageDir = join(rootDir, `testcafe-${version}`);
+
+function hashFiles(root) {
+  const hashes = {};
+  function walk(directory) {
+    for (const item of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, item.name);
+      if (item.isDirectory()) walk(path);
+      else hashes[relative(root, path)] = createHash('sha256').update(readFileSync(path)).digest('hex');
+    }
+  }
+  walk(root);
+  return hashes;
 }
 
-build() {
-  cd "$build_dir/package"
-  for patch_file in "$work_dir"/patches/*.patch; do patch -p1 <"$patch_file"; done
-  grep -q "process.platform === 'openharmony'" lib/browser/provider/built-in/index.js
-  grep -q 'generateThumbnail' lib/ohos/thumbnail.cjs
-  grep -q 'supportMultipleWindows:true' lib/ohos/provider.cjs
-  node - "$build_dir/package" "$build_dir/upstream-hashes.json" <<'JS'
-const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),assert=require('node:assert/strict');
-const root=process.argv[2],before=JSON.parse(fs.readFileSync(process.argv[3]));
-const allowed=new Set(['package.json','lib/browser/provider/built-in/index.js','lib/screenshots/capturer.js']);
-for(const [file,hash] of Object.entries(before)){const current=crypto.createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex');if(!allowed.has(file))assert.equal(current,hash,file);}
-function walk(dir){for(const item of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,item.name);if(item.isDirectory())walk(p);else {const rel=path.relative(root,p);assert.ok(rel in before||rel.startsWith('lib/ohos/'),rel);}}}
-walk(root);
-JS
+function verifyUpstreamChanges(root, hashesFile) {
+  const before = JSON.parse(readFileSync(hashesFile, 'utf8'));
+  const allowed = new Set(['package.json', 'lib/browser/provider/built-in/index.js', 'lib/screenshots/capturer.js']);
+  for (const [file, hash] of Object.entries(before)) {
+    const current = createHash('sha256').update(readFileSync(join(root, file))).digest('hex');
+    if (!allowed.has(file)) assert.equal(current, hash, file);
+  }
+  function walk(directory) {
+    for (const item of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, item.name);
+      if (item.isDirectory()) walk(path);
+      else {
+        const file = relative(root, path);
+        assert.ok(file in before || file.startsWith('lib/ohos/'), file);
+      }
+    }
+  }
+  walk(root);
 }
 
-package() {
-  rm -rf "$package_dir"
-  mv "$build_dir/package" "$package_dir"
-  cd "$package_dir"
-}
+export default class Testcafe extends Port {
+  static pkgname = 'testcafe';
+  static upstream = 'testcafe';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [`testcafe-${version}`];
+  static source = `https://registry.npmjs.org/testcafe/-/testcafe-${version}.tgz`;
+  static sha256 = 'd439a391e21a8b8d529481cbbec848b6182096e56382dbd4d394680bab9886f4';
 
-check() {
-  package_version=$(node -p "require('${package_dir}/package.json').version")
-  npm pack --ignore-scripts --pack-destination "$build_dir"
-  rm -rf "$build_dir/consumer"
-  mkdir -p "$build_dir/consumer"
-  node - "$build_dir" "$package_version" <<'JS'
-const fs=require('node:fs'),path=require('node:path');const root=process.argv[2],version=process.argv[3];fs.writeFileSync(path.join(root,'consumer/package.json'),JSON.stringify({private:true,dependencies:{testcafe:`file:${path.join(root,'ohos-npm-ports-testcafe-'+version+'.tgz')}`}}));
-JS
-  cd "$build_dir/consumer"
-  npm install --ignore-scripts --no-audit --no-fund
-  export TESTCAFE_PACKAGE="$build_dir/consumer/node_modules/testcafe"
-  export NODE_PATH="$build_dir/consumer/node_modules"
-  node - "$TESTCAFE_PACKAGE" "$package_version" <<'JS'
-const assert=require('node:assert/strict'),path=require('node:path');const root=process.argv[2],p=require(path.join(root,'package.json'));
-assert.equal(p.name,'@ohos-npm-ports/testcafe');assert.equal(p.version,process.argv[3]);assert.equal(typeof require(root),'function');
-JS
-  PORT_TEST_REPORT="$build_dir/consumer-report.json" node "$work_dir/test.js"
-  node "$work_dir/tests/platforms.cjs"
-  node --test "$work_dir"/tests/*.test.cjs "$work_dir"/tests/*.test.mjs
-  node -e "const assert=require('node:assert/strict');assert.equal(require('testcafe/package.json').version,'${package_version}');assert.equal(typeof require('testcafe'),'function')"
-  node node_modules/testcafe/bin/testcafe.js --version
+  prepare() {
+    process.env.npm_config_registry = 'https://registry.npmjs.org';
+    process.env.OPENSSL_CONF = '/dev/null';
+    mkdirSync(buildDir, { recursive: true });
+    fetchSource(join(buildDir, 'upstream.tgz'));
+    rmSync(sourceDir, { recursive: true, force: true });
+    run('tar', ['-xzf', join(buildDir, 'upstream.tgz'), '-C', buildDir]);
+    writeFileSync(join(buildDir, 'upstream-hashes.json'), JSON.stringify(hashFiles(sourceDir)));
+  }
+
+  build() {
+    cd(sourceDir);
+    const patches = readdirSync(join(rootDir, 'patches')).filter((file) => file.endsWith('.patch')).sort();
+    for (const file of patches) run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches', file)) });
+    assert.ok(readFileSync('lib/browser/provider/built-in/index.js', 'utf8').includes("process.platform === 'openharmony'"));
+    assert.ok(readFileSync('lib/ohos/thumbnail.cjs', 'utf8').includes('generateThumbnail'));
+    assert.ok(readFileSync('lib/ohos/provider.cjs', 'utf8').includes('supportMultipleWindows:true'));
+    verifyUpstreamChanges(sourceDir, join(buildDir, 'upstream-hashes.json'));
+  }
+
+  package() {
+    rmSync(packageDir, { recursive: true, force: true });
+    renameSync(sourceDir, packageDir);
+    cd(packageDir);
+  }
+
+  test() {
+    const context = recipeContext();
+    process.env.OPENSSL_CONF = '/dev/null';
+    const manifestPath = context.resolvePackage('testcafe/package.json');
+    const root = dirname(manifestPath);
+    const pkg = requirePackage('testcafe/package.json');
+    const testcafe = requirePackage('testcafe');
+    const selector = testcafe.Selector('#example');
+    const client = testcafe.ClientFunction(() => 42);
+    const logger = testcafe.RequestLogger('http://example.invalid');
+    assert.equal(typeof testcafe, 'function');
+    assert.equal(typeof selector, 'function');
+    assert.equal(typeof client, 'function');
+    assert.ok(Array.isArray(logger.requests));
+    if (context.mode === 'baseline') {
+      assert.equal(pkg.name, 'testcafe');
+      assert.equal(pkg.version, version);
+    } else {
+      assert.equal(pkg.name, '@ohos-npm-ports/testcafe');
+      assert.equal(pkg.version, context.portVersion);
+    }
+    if (process.platform === 'openharmony') {
+      const providers = requirePackage(join(root, 'lib/browser/provider/built-in'));
+      assert.equal(providers.chrome.supportMultipleWindows, true);
+      assert.equal(typeof providers.chrome.takeScreenshot, 'function');
+      assert.equal(providers.chrome, providers.haitai);
+    }
+
+    if (context.mode !== 'baseline' && process.platform === 'openharmony') {
+      const testsDir = join(rootDir, 'tests');
+      const env = {
+        TESTCAFE_PACKAGE: root,
+        NODE_PATH: [join(context.projectDir, 'node_modules'), process.env.NODE_PATH].filter(Boolean).join(delimiter),
+        OPENSSL_CONF: '/dev/null',
+      };
+      run(process.execPath, [join(testsDir, 'platforms.cjs')], { env });
+      const files = readdirSync(testsDir);
+      const tests = [
+        ...files.filter((file) => file.endsWith('.test.cjs')).sort(),
+        ...files.filter((file) => file.endsWith('.test.mjs')).sort(),
+      ].map((file) => join(testsDir, file));
+      run(process.execPath, ['--test', ...tests], { env });
+    }
+    run(process.execPath, [join(root, 'bin/testcafe.js'), '--version']);
+    return {
+      result: { selector: typeof selector, clientFunction: typeof client, requests: logger.requests },
+      assets: [],
+    };
+  }
 }

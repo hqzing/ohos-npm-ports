@@ -1,59 +1,138 @@
-#!/usr/bin/env bash
-pkgname="domparser-rs"
-upstream="domparser-rs"
-version="0.0.7"
-revision=3
-# npm 包与固定源码 commit 需人工配套升级。
-bump=false
-source="https://registry.npmjs.org/domparser-rs/-/domparser-rs-${version}.tgz"
-sha256="fef9487622af8ccc1e4fdc60e1795fde5ad84766d3dd253e601d648a8fa5dc5e"
-resource "upstream" \
-  "https://codeload.github.com/utooland/domparser-rs/tar.gz/79e32cd0ae4902a907a91b9c079c3de1f152db95" \
-  "cea5f6328b4db383de21aed329d6500eba5fa5537725242903705410584e773b"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
+import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import vm from 'node:vm';
 
-packages=(
-  "domparser-rs-${version}"
-)
+const version = '0.0.7';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const sourceDir = join(buildDir, 'source');
+const packageDir = join(rootDir, `domparser-rs-${version}`);
 
-root_dir="$NPMBUILD_DIR"
-build_dir="$root_dir/build"
-source_dir="$build_dir/source"
-package_dir="$root_dir/domparser-rs-${version}"
-
-prepare() {
-  command -v cargo >/dev/null
-  [ "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-unknown-linux-ohos ]
-
-  mkdir -p "$build_dir"
-  fetch_resource "upstream" "$build_dir/source.tgz"
-  fetch_source "$build_dir/package.tgz"
-  rm -rf "$source_dir" "$package_dir" "$build_dir/upstream"
-  mkdir -p "$source_dir" "$package_dir" "$build_dir/upstream"
-  tar xzf "$build_dir/source.tgz" -C "$source_dir" --strip-components=1
-  tar xzf "$build_dir/package.tgz" -C "$build_dir/upstream" --strip-components=1
-  cp -R "$build_dir/upstream/." "$package_dir/"
+function verifyUpstreamFiles() {
+  const pkg = readJson(join(packageDir, 'package.json'));
+  const original = readJson(join(buildDir, 'upstream/package.json'));
+  assert.deepEqual(pkg.optionalDependencies, original.optionalDependencies);
+  assert.ok(pkg.files.includes('domparser.openharmony-arm64.node'));
+  assert.ok(statSync(join(packageDir, 'domparser.openharmony-arm64.node')).size > 0);
+  for (const file of readdirSync(join(buildDir, 'upstream'))) {
+    if (file === 'package.json') continue;
+    assert.deepEqual(readFileSync(join(packageDir, file)), readFileSync(join(buildDir, 'upstream', file)), file);
+  }
+  for (const [platform, arch, musl, expected] of [
+    ['openharmony', 'arm64', false, './domparser.openharmony-arm64.node'],
+    ['linux', 'arm64', false, 'domparser-linux-arm64-gnu'],
+    ['linux', 'arm64', true, 'domparser-linux-arm64-musl'],
+    ['darwin', 'arm64', false, 'domparser-darwin-arm64'],
+    ['win32', 'x64', false, 'domparser-win32-x64-msvc'],
+  ]) {
+    const native = { NodeRepr: class {}, parse() {} };
+    let selected;
+    const module = { exports: {} };
+    vm.runInNewContext(readFileSync(join(packageDir, 'index.js'), 'utf8'), {
+      process: { platform, arch, env: {} }, module, exports: module.exports,
+      require(id) {
+        if (id === 'fs' || id === 'node:fs') return { readFileSync: () => musl ? 'musl' : 'glibc' };
+        if (id === expected) { selected = id; return native; }
+        if (id === `${expected}/package.json`) return { version };
+        throw new Error(`not installed: ${id}`);
+      },
+    });
+    assert.equal(selected, expected);
+    assert.equal(module.exports, native);
+  }
+  const expected = structuredClone(original);
+  expected.files.push('domparser.openharmony-arm64.node');
+  delete expected.scripts.prepare;
+  delete expected.scripts.prepublishOnly;
+  assert.deepEqual(pkg, expected);
 }
 
-build() {
-  cd "$source_dir"
-  export CARGO_TARGET_DIR="$build_dir/target"
-  cargo build --locked --release -p domparser_napi -j "${CARGO_BUILD_JOBS:-2}"
-}
+export default class DomparserRs extends Port {
+  static pkgname = 'domparser-rs';
+  static upstream = 'domparser-rs';
+  static version = version;
+  static revision = 3;
+  static bump = false;
+  static source = `https://registry.npmjs.org/domparser-rs/-/domparser-rs-${version}.tgz`;
+  static sha256 = 'fef9487622af8ccc1e4fdc60e1795fde5ad84766d3dd253e601d648a8fa5dc5e';
+  static resources = [
+    resource(
+      'upstream',
+      'https://codeload.github.com/utooland/domparser-rs/tar.gz/79e32cd0ae4902a907a91b9c079c3de1f152db95',
+      'cea5f6328b4db383de21aed329d6500eba5fa5537725242903705410584e773b',
+    ),
+  ];
+  static distTag = 'latest';
+  static packages = [`domparser-rs-${version}`];
 
-package() {
-  cd "$package_dir"
-  patch -p1 <"$root_dir/patches/0001-package-json.patch"
-  cp "$build_dir/target/release/libdomparser_napi.so" domparser.openharmony-arm64.node
-}
+  prepare() {
+    run('cargo', ['--version']);
+    const host = run('rustc', ['-vV'], { capture: true }).stdout.match(/^host: (.+)$/m)?.[1];
+    assert.equal(host, 'aarch64-unknown-linux-ohos');
 
-check() {
-  grep -q "process.platform === 'openharmony'" "$package_dir/index.js"
-  node "$root_dir/verify.cjs" "$package_dir" "$build_dir/upstream"
-  cd "$package_dir"
-  package_version=$(node -p "require('./package.json').version")
-  npm pack --ignore-scripts --pack-destination "$build_dir"
-  mkdir -p "$build_dir/packed"
-  tar xzf "$build_dir/ohos-npm-ports-domparser-rs-${package_version}.tgz" -C "$build_dir/packed"
-  test -s "$build_dir/packed/package/domparser.openharmony-arm64.node"
+    mkdirSync(buildDir, { recursive: true });
+    fetchResource('upstream', join(buildDir, 'source.tgz'));
+    fetchSource(join(buildDir, 'package.tgz'));
+    rmSync(sourceDir, { recursive: true, force: true });
+    rmSync(packageDir, { recursive: true, force: true });
+    rmSync(join(buildDir, 'upstream'), { recursive: true, force: true });
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(packageDir, { recursive: true });
+    mkdirSync(join(buildDir, 'upstream'), { recursive: true });
+    run('tar', ['xzf', join(buildDir, 'source.tgz'), '-C', sourceDir, '--strip-components=1']);
+    run('tar', ['xzf', join(buildDir, 'package.tgz'), '-C', join(buildDir, 'upstream'), '--strip-components=1']);
+    cpSync(join(buildDir, 'upstream'), packageDir, { recursive: true });
+  }
+
+  build() {
+    cd(sourceDir);
+    process.env.CARGO_TARGET_DIR = join(buildDir, 'target');
+    run('cargo', ['build', '--locked', '--release', '-p', 'domparser_napi', '-j', process.env.CARGO_BUILD_JOBS ?? '2']);
+  }
+
+  package() {
+    cd(packageDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-package-json.patch')) });
+    cpSync(join(buildDir, 'target/release/libdomparser_napi.so'), join(packageDir, 'domparser.openharmony-arm64.node'));
+    verifyUpstreamFiles();
+  }
+
+  test() {
+    const { mode, portVersion } = recipeContext();
+    const { DOMParser, parse } = requirePackage('domparser-rs');
+    const pkg = requirePackage('domparser-rs/package.json');
+    if (mode !== 'baseline') {
+      assert.equal(pkg.name, '@ohos-npm-ports/domparser-rs');
+      assert.equal(pkg.version, portVersion);
+    }
+    const parser = new DOMParser();
+    const doc = parser.parseFromString('<html><body><p id="proof" class="a">native &amp; DOM</p></body></html>', 'text/html');
+    const node = doc.querySelector('#proof');
+    assert.equal(node.textContent, 'native & DOM');
+    assert.equal(doc.querySelector('#missing'), null);
+    node.classList.add('verified');
+    assert(node.classList.contains('verified'));
+    node.classList.remove('a');
+    assert(!node.classList.contains('a'));
+    assert.equal(node.classList.toggle('temporary'), true);
+    assert.equal(node.classList.toggle('temporary'), false);
+    node.setAttribute('data-port', 'source-built');
+    assert.equal(node.getAttribute('data-port'), 'source-built');
+    assert.equal(parse('<section><b>parsed</b></section>').querySelector('b').textContent, 'parsed');
+    assert.throws(() => parser.parseFromString('<x/>', 'application/xml'), /Unsupported mime type/);
+    return {
+      result: {
+        text: node.textContent,
+        className: node.getAttribute('class'),
+        attribute: node.getAttribute('data-port'),
+        missingSelector: true,
+        directParse: true,
+        unsupportedMimeRejected: true,
+      },
+      assets: [],
+    };
+  }
 }

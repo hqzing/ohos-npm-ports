@@ -1,93 +1,107 @@
-#!/usr/bin/env bash
-pkgname="next"
-upstream="next"
-version="16.4.3"
-revision=1
-source="https://registry.npmjs.org/${pkgname}/-/${pkgname}-${version}.tgz"
-sha256="d37409b7530c4873cd14c0619a7b8734777fd0dc2cae627bb592e5a82f74f8f4"
-resource "upstream" \
-  "https://codeload.github.com/vercel/next.js/tar.gz/refs/tags/v${version}" \
-  "403b3475f119fd0894c3ed57c6b434edb00cf4675a5d3aeeb983521e9f948ccd"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { Port, resource, run, cd, fetchSource, fetchResource, writeJson } from '../../../cli/recipe.mjs';
+import { chmodSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
-packages=(
-  "@ohos-npm-ports/next-swc-openharmony-arm64:next-swc-openharmony-arm64"
-  "next-${version}"
-)
-root_dir="$NPMBUILD_DIR"
+const version = '16.4.3';
+const rootDir = import.meta.dirname;
+const sourceDir = join(rootDir, 'src');
+const packageDir = join(rootDir, `next-${version}`);
+const slotPackageDir = join(rootDir, 'next-swc-openharmony-arm64');
 
-prepare() {
-  # ===== deps =====
-  command -v curl >/dev/null
-  command -v cargo >/dev/null
+export default class Next extends Port {
+  static pkgname = 'next';
+  static upstream = 'next';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [
+    '@ohos-npm-ports/next-swc-openharmony-arm64:next-swc-openharmony-arm64',
+    `next-${version}`,
+  ];
+  static source = `https://registry.npmjs.org/next/-/next-${version}.tgz`;
+  static sha256 = 'd37409b7530c4873cd14c0619a7b8734777fd0dc2cae627bb592e5a82f74f8f4';
+  static resources = [
+    resource(
+      'upstream',
+      `https://codeload.github.com/vercel/next.js/tar.gz/refs/tags/v${version}`,
+      '403b3475f119fd0894c3ed57c6b434edb00cf4675a5d3aeeb983521e9f948ccd',
+    ),
+  ];
 
-  rm -rf "$root_dir/src" "$root_dir/next-$version" "$root_dir/next-swc-openharmony-arm64"
-  mkdir -p "$root_dir/src" "$root_dir/next-swc-openharmony-arm64"
+  prepare() {
+    run('sh', ['-c', 'command -v curl']);
+    run('sh', ['-c', 'command -v cargo']);
+    rmSync(sourceDir, { recursive: true, force: true });
+    rmSync(packageDir, { recursive: true, force: true });
+    rmSync(slotPackageDir, { recursive: true, force: true });
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(slotPackageDir, { recursive: true });
 
-  fetch_resource "upstream" "$root_dir/next-source.tar.gz"
-  tar -zxf "$root_dir/next-source.tar.gz" -C "$root_dir/src" --strip-components=1
-  rm -f "$root_dir/next-source.tar.gz"
-  rm -f "$root_dir/src/rust-toolchain.toml"
+    const sourceArchive = join(rootDir, 'next-source.tar.gz');
+    fetchResource('upstream', sourceArchive);
+    run('tar', ['-zxf', sourceArchive, '-C', sourceDir, '--strip-components=1']);
+    rmSync(sourceArchive, { force: true });
+    rmSync(join(sourceDir, 'rust-toolchain.toml'), { force: true });
 
-  fetch_source "$root_dir/next.tgz"
-  tar -zxf "$root_dir/next.tgz" -C "$root_dir"
-  mv "$root_dir/package" "$root_dir/next-$version"
-  rm -f "$root_dir/next.tgz"
-}
+    const packageArchive = join(rootDir, 'next.tgz');
+    fetchSource(packageArchive);
+    run('tar', ['-zxf', packageArchive, '-C', rootDir]);
+    renameSync(join(rootDir, 'package'), packageDir);
+    rmSync(packageArchive, { force: true });
+  }
 
-build() {
-  host_triple=$(rustc -vV | sed -n 's/^host: //p')
-  [ "$host_triple" = "aarch64-unknown-linux-ohos" ]
+  build() {
+    const host = run('rustc', ['-vV'], { capture: true }).stdout.match(/^host: (.+)$/m)?.[1];
+    assert.equal(host, 'aarch64-unknown-linux-ohos');
 
-  cd "$root_dir/src"
-  git init
-  git -c user.name=npm-ports -c user.email=npm-ports@localhost commit --allow-empty -m "Next.js $version source"
-  patch -p1 <"$root_dir/patches/0003-turbo-tasks-fs-ohos.patch"
-  grep -q "into_os_string" turbopack/crates/turbo-tasks-fs/src/disk.rs
-  patch -p1 <"$root_dir/patches/0004-openharmony-project-path.patch"
-  grep -q "into_os_string" crates/next-napi-bindings/src/next_api/project.rs
-  # The upstream workspace enables nightly-only optimization flags. The build
-  # image uses stable rustc, so bootstrap those flags without another toolchain.
-  export RUSTC_BOOTSTRAP=1
-  cargo build -p next-napi-bindings --release \
-    --features image-extended,tracing/release_max_level_trace
-  test -f target/release/libnext_napi_bindings.so
-  cp target/release/libnext_napi_bindings.so \
-    "$root_dir/next-swc-openharmony-arm64/next-swc.openharmony-arm64.node"
-  cd "$root_dir"
-}
+    cd(sourceDir);
+    run('git', ['init']);
+    run('git', [
+      '-c', 'user.name=npm-ports',
+      '-c', 'user.email=npm-ports@localhost',
+      'commit', '--allow-empty', '-m', `Next.js ${version} source`,
+    ]);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0003-turbo-tasks-fs-ohos.patch')) });
+    assert.ok(readFileSync('turbopack/crates/turbo-tasks-fs/src/disk.rs', 'utf8').includes('into_os_string'));
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0004-openharmony-project-path.patch')) });
+    assert.ok(readFileSync('crates/next-napi-bindings/src/next_api/project.rs', 'utf8').includes('into_os_string'));
+    process.env.RUSTC_BOOTSTRAP = '1';
+    run('cargo', [
+      'build', '-p', 'next-napi-bindings', '--release',
+      '--features', 'image-extended,tracing/release_max_level_trace',
+    ]);
+    const nativeSource = 'target/release/libnext_napi_bindings.so';
+    assert.ok(statSync(nativeSource).isFile());
+    cpSync(nativeSource, join(slotPackageDir, 'next-swc.openharmony-arm64.node'));
+    cd(rootDir);
+  }
 
-package() {
-  llvm-strip --strip-all \
-    next-swc-openharmony-arm64/next-swc.openharmony-arm64.node
-  chmod +x next-swc-openharmony-arm64/next-swc.openharmony-arm64.node
+  package() {
+    cd(rootDir);
+    const native = join(slotPackageDir, 'next-swc.openharmony-arm64.node');
+    run('llvm-strip', ['--strip-all', native]);
+    chmodSync(native, statSync(native).mode | 0o111);
 
-  cd "$root_dir/next-$version"
-  patch -p1 <"$root_dir/patches/0001-openharmony-loader.patch"
-  patch -p1 <"$root_dir/patches/0002-package-json.patch"
-  cd "$root_dir"
+    cd(packageDir);
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-openharmony-loader.patch')) });
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0002-package-json.patch')) });
+    cd(rootDir);
 
-  cat >next-swc-openharmony-arm64/package.json <<EOF
-{
-  "version": "${version}",
-  "description": "OpenHarmony arm64 native SWC binding for Next.js",
-  "os": ["openharmony"],
-  "cpu": ["arm64"],
-  "main": "next-swc.openharmony-arm64.node",
-  "files": ["next-swc.openharmony-arm64.node"],
-  "license": "MIT",
-  "engines": { "node": ">= 20" }
-}
-EOF
-}
+    writeJson(join(slotPackageDir, 'package.json'), {
+      version,
+      description: 'OpenHarmony arm64 native SWC binding for Next.js',
+      os: ['openharmony'],
+      cpu: ['arm64'],
+      main: 'next-swc.openharmony-arm64.node',
+      files: ['next-swc.openharmony-arm64.node'],
+      license: 'MIT',
+      engines: { node: '>= 20' },
+    });
 
-check() {
-  node -e '
-    const main = require("./next-'"${version}"'/package.json");
-    const sub = require("./next-swc-openharmony-arm64/package.json");
-    if (main.name !== "@ohos-npm-ports/next" || main.version !== sub.version) process.exit(1);
-    if (main.optionalDependencies[sub.name] !== sub.version) process.exit(1);
-  '
-  grep -q "openharmony-arm64" next-${version}/dist/build/swc/index.js
-  grep -q "@ohos-npm-ports/next-swc-openharmony-arm64" next-${version}/dist/build/swc/index.js
+    const loader = readFileSync(join(packageDir, 'dist/build/swc/index.js'), 'utf8');
+    assert.ok(loader.includes('openharmony-arm64'));
+    assert.ok(loader.includes('@ohos-npm-ports/next-swc-openharmony-arm64'));
+  }
 }
