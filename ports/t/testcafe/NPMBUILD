@@ -2,7 +2,7 @@
 pkgname="testcafe"
 upstream="testcafe"
 version="3.7.7"
-revision=1
+revision=2
 source="https://registry.npmjs.org/testcafe/-/testcafe-${version}.tgz"
 sha256="d439a391e21a8b8d529481cbbec848b6182096e56382dbd4d394680bab9886f4"
 dist_tag="latest"
