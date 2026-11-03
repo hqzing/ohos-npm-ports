@@ -1,168 +1,138 @@
-#!/usr/bin/env bash
-pkgname="yuku-parser"
-upstream="yuku-parser"
-version="0.19.0"
-revision=1
-source="https://registry.npmjs.org/${pkgname}/-/${pkgname}-${version}.tgz"
-sha256="3655d771568e9e326a99ff5e43a6e72d4150f8098125c125e9e05d20c13172e5"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, writeJson, importPackage } from '../../../cli/recipe.mjs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
-packages=(
-  "yuku-parser-${version}"
-)
-slot_name="@yuku-core/binding-openharmony-arm64"
-zig_version="0.17.0"
-resource "yuku" \
-  "https://github.com/yuku-toolchain/yuku/archive/refs/tags/v${version}.tar.gz" \
-  "81f8015d458307f537865259604ee1ac6e169850ac6c280f4406387285ee613b"
-resource "zig" \
-  "https://ziglang.org/download/${zig_version}/zig-aarch64-linux-${zig_version}.tar.xz" \
-  "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
-work_dir="$NPMBUILD_DIR"
-stage_dir="${work_dir}/build"
-output_dir="${work_dir}/${pkgname}-${version}"
+const version = '0.19.0';
+const slotName = '@yuku-core/binding-openharmony-arm64';
+const zigVersion = '0.17.0';
+const rootDir = import.meta.dirname;
+const stageDir = join(rootDir, 'build');
+const sourceDir = join(stageDir, 'src');
+const outputDir = join(rootDir, `yuku-parser-${version}`);
 
-prepare() {
-  # ============================================================
-  # ohos-npm-ports: @ohos-npm-ports/yuku-parser ${version}
-  #
-  # 构建方式：
-  #   1. 下载官方 yuku-parser@${version} tarball 与 yuku monorepo v${version}，
-  #      钉住所有下载的 sha256
-  #   2. 打 patch 配置 bundledDependencies，grep marker
-  #   3. 用 zig 0.17 把 monorepo 里的 napi-zig yuku-core binding 交叉编译到
-  #      aarch64-linux-musl（与 OHOS 同 libc 族）
-  #   4. 零依赖重打包：上游 parser 全部内容进发布目录，并把上游 yuku-core 作为
-  #      bundled dependency 嵌进 node_modules/yuku-core；编译后的 binding 放进
-  #      yuku-core/@yuku-core/binding-openharmony-arm64/
-  #   5. 用真实 loader 解析一段 TS，冒烟容器 node 的 process.platform 就是 openharmony
-  #
-  # 0.19.0 把 native binding 从 yuku-parser 拆到了 yuku-core；其 binding.js 按
-  # process.platform/process.arch 拼后缀，先找包内 @yuku-core/binding-${suffix}。
-  # 因此 binding 必须嵌在 bundled yuku-core 内，而不是 parser 根目录。
-  #
-  # 发布目录名必须与 NPMBUILD packages 一致，并留在配方目录根下，
-  # 所以中间件放 STAGE，成品由 package() 落到 OUT，check() 不删 OUT。
-  # ============================================================
-
-  # ===== fetch =====
-  echo "=== fetch: 官方 ${pkgname}@${version} + yuku monorepo + zig ==="
-  rm -rf "${stage_dir}"
-  mkdir -p "${stage_dir}"
-  cd "${stage_dir}"
-
-  fetch_source src.tgz
-  tar -zxf src.tgz
-  rm src.tgz
-  mv package src
-
-  fetch_resource "yuku" yuku.tgz
-  tar -zxf yuku.tgz
-  rm yuku.tgz
-  mv "yuku-${version}" yuku
-
-  fetch_resource "zig" zig.tar.xz
-  tar -xJf zig.tar.xz
-  rm zig.tar.xz
+function hashTree(directory) {
+  const hashes = {};
+  function walk(current, prefix = '') {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const name = prefix + entry.name;
+      const file = join(current, entry.name);
+      if (entry.isDirectory()) walk(file, `${name}/`);
+      else if (entry.isFile()) hashes[name] = createHash('sha256').update(readFileSync(file)).digest('hex');
+    }
+  }
+  walk(directory);
+  return Object.fromEntries(Object.entries(hashes).sort((left, right) => left[0].localeCompare(right[0])));
 }
 
-build() {
-  echo "=== build: 打 patch + grep marker + 交叉编译 yuku-core binding ==="
-  cd "${stage_dir}/src"
+export default class YukuParser extends Port {
+  static pkgname = 'yuku-parser';
+  static upstream = 'yuku-parser';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static source = `https://registry.npmjs.org/yuku-parser/-/yuku-parser-${version}.tgz`;
+  static sha256 = '3655d771568e9e326a99ff5e43a6e72d4150f8098125c125e9e05d20c13172e5';
+  static resources = [
+    resource(
+      'yuku',
+      `https://github.com/yuku-toolchain/yuku/archive/refs/tags/v${version}.tar.gz`,
+      '81f8015d458307f537865259604ee1ac6e169850ac6c280f4406387285ee613b',
+    ),
+    resource(
+      'zig',
+      `https://ziglang.org/download/${zigVersion}/zig-aarch64-linux-${zigVersion}.tar.xz`,
+      '9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8',
+    ),
+  ];
+  static packages = [`yuku-parser-${version}`];
 
-  # check() 拿它断言 patch 只改了 package.json
-  find . -type f -exec sha256sum {} + | sed 's|\./||' | sort >"${work_dir}/before.sha256"
+  prepare() {
+    rmSync(stageDir, { recursive: true, force: true });
+    mkdirSync(stageDir, { recursive: true });
+    cd(stageDir);
+    fetchSource(join(stageDir, 'src.tgz'));
+    run('tar', ['-zxf', join(stageDir, 'src.tgz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'src.tgz'), { force: true });
+    renameSync(join(stageDir, 'package'), sourceDir);
+    fetchResource('yuku', join(stageDir, 'yuku.tgz'));
+    run('tar', ['-zxf', join(stageDir, 'yuku.tgz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'yuku.tgz'), { force: true });
+    renameSync(join(stageDir, `yuku-${version}`), join(stageDir, 'yuku'));
+    fetchResource('zig', join(stageDir, 'zig.tar.xz'));
+    run('tar', ['-xJf', join(stageDir, 'zig.tar.xz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'zig.tar.xz'), { force: true });
+  }
 
-  patch -p1 <"${work_dir}/patches/0001-update-package-json.patch"
-  # patch 对零上下文 hunk 的越界行号会静默套用到文件末尾（exit 0）
-  grep -q "\"version\": \"${version}\"" package.json
-  grep -q "\"bundledDependencies\"" package.json
-  grep -q "\"yuku-core\"" package.json
+  build() {
+    cd(sourceDir);
+    writeJson(join(stageDir, 'before-hashes.json'), hashTree(sourceDir));
+    run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches/0001-update-package-json.patch')) });
+    const manifest = readFileSync(join(sourceDir, 'package.json'), 'utf8');
+    assert.ok(manifest.includes(`"version": "${version}"`));
+    assert.ok(manifest.includes('"bundledDependencies"'));
+    assert.ok(manifest.includes('"yuku-core"'));
+    const yukuDir = join(stageDir, 'yuku');
+    cd(yukuDir);
+    run(join(stageDir, `zig-aarch64-linux-${zigVersion}/zig`), ['build', '-Dtarget=aarch64-linux-musl', '-Doptimize=ReleaseFast']);
+    assert.ok(statSync(join(yukuDir, 'zig-out/lib/yuku-core.node')).size > 0);
+    copyFileSync(join(yukuDir, 'zig-out/lib/yuku-core.node'), join(stageDir, 'yuku-core.node'));
+  }
 
-  cd "${stage_dir}/yuku"
-  "${stage_dir}/zig-aarch64-linux-${zig_version}/zig" build \
-    -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast
-  test -f "zig-out/lib/yuku-core.node"
-  cp "zig-out/lib/yuku-core.node" "${stage_dir}/yuku-core.node"
-}
+  package() {
+    rmSync(outputDir, { recursive: true, force: true });
+    cpSync(sourceDir, outputDir, { recursive: true });
+    const coreDir = join(outputDir, 'node_modules/yuku-core');
+    mkdirSync(coreDir, { recursive: true });
+    for (const file of ['index.js', 'index.d.ts', 'binding.js', 'browser.js', 'options.js', 'README.md']) {
+      copyFileSync(join(stageDir, 'yuku/npm/yuku-core', file), join(coreDir, file));
+    }
+    const core = readJson(join(stageDir, 'yuku/npm/yuku-core/package.json'));
+    core.version = version;
+    core.dependencies = { '@yuku-toolchain/types': `^${core.version}` };
+    delete core.optionalDependencies;
+    core.repository = {
+      type: 'git',
+      url: 'git+https://github.com/ohos-npm-ports/ohos-npm-ports.git',
+      directory: 'ports/y/yuku-parser',
+    };
+    core.files = [...core.files, slotName];
+    writeJson(join(coreDir, 'package.json'), core);
+    mkdirSync(join(coreDir, slotName), { recursive: true });
+    copyFileSync(join(stageDir, 'yuku-core.node'), join(coreDir, slotName, 'yuku-core.node'));
+    rmSync(join(outputDir, 'package.json.orig'), { force: true });
+    const pkg = readJson(join(outputDir, 'package.json'));
+    assert.equal(pkg.version, version);
+    assert.ok(pkg.bundledDependencies?.includes('yuku-core'));
+    const bundledCore = readJson(join(coreDir, 'package.json'));
+    assert.equal(bundledCore.name, 'yuku-core');
+    assert.equal(bundledCore.version, pkg.version);
+    assert.ok(bundledCore.files?.includes(slotName));
+    assert.ok(!bundledCore.optionalDependencies);
+    const before = readJson(join(stageDir, 'before-hashes.json'));
+    const after = hashTree(outputDir);
+    const beforeFiles = Object.fromEntries(Object.entries(before).filter(entry => entry[0] !== 'package.json'));
+    const afterFiles = Object.fromEntries(Object.entries(after).filter(entry => entry[0] !== 'package.json' && !entry[0].startsWith('node_modules/')));
+    assert.deepEqual(afterFiles, beforeFiles);
+    rmSync(stageDir, { recursive: true, force: true });
+    assert.ok(existsSync(outputDir));
+  }
 
-package() {
-  echo "=== package: 组装 yuku-parser + 内置 yuku-core + OpenHarmony binding ==="
-  rm -rf "${output_dir}"
-  cp -a "${stage_dir}/src" "${output_dir}"
+  static testPlatforms = ['openharmony'];
+  static testPlatformReason = 'The bundled native binding in this port supports only OpenHarmony arm64.';
+  static testTimeout = 600_000;
 
-  core_dir="${output_dir}/node_modules/yuku-core"
-  mkdir -p "${core_dir}"
-  for file in index.js index.d.ts binding.js browser.js options.js README.md; do
-    cp "${stage_dir}/yuku/npm/yuku-core/${file}" "${core_dir}/${file}"
-  done
-
-  # bundled yuku-core 的 manifest 必须去掉上游 optionalDependencies（否则 npm 会
-  # 再拉一套非 OHOS 的 binding），并把包内 OpenHarmony binding 加进 files，
-  # 否则 npm pack 会按上游 files 白名单把它排除掉。
-  node - "${stage_dir}/yuku/npm/yuku-core/package.json" "${core_dir}/package.json" "${slot_name}" "${version}" <<'NODE'
-const fs = require("node:fs");
-const [source, target, slot, version] = process.argv.slice(2);
-const pkg = JSON.parse(fs.readFileSync(source, "utf8"));
-pkg.version = version;
-pkg.dependencies = { "@yuku-toolchain/types": `^${pkg.version}` };
-delete pkg.optionalDependencies;
-pkg.repository = {
-  type: "git",
-  url: "git+https://github.com/ohos-npm-ports/ohos-npm-ports.git",
-  directory: "ports/y/yuku-parser",
-};
-pkg.files = [...pkg.files, slot];
-fs.writeFileSync(target, `${JSON.stringify(pkg, null, 2)}\n`);
-NODE
-
-  mkdir -p "${core_dir}/${slot_name}"
-  cp "${stage_dir}/yuku-core.node" "${core_dir}/${slot_name}/yuku-core.node"
-
-  cd "${output_dir}"
-  node - "${slot_name}" "${version}" <<'NODE'
-const fs = require("node:fs");
-const [slot, version] = process.argv.slice(2);
-const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-if (pkg.version !== version) { console.error(`bad version: ${pkg.version}`); process.exit(1); }
-if (!pkg.bundledDependencies?.includes("yuku-core")) { console.error("yuku-core is not bundled"); process.exit(1); }
-const core = JSON.parse(fs.readFileSync("node_modules/yuku-core/package.json", "utf8"));
-if (core.name !== "yuku-core" || core.version !== pkg.version) { console.error(`bad core manifest: ${core.name}@${core.version}`); process.exit(1); }
-if (!core.files?.includes(slot)) { console.error(`core files do not include ${slot}`); process.exit(1); }
-if (core.optionalDependencies) { console.error("core still lists upstream optional bindings"); process.exit(1); }
-console.log("OK: manifests");
-NODE
-}
-
-check() {
-  echo "=== test: 哈希不变量 + 真实 loader 解析冒烟 ==="
-  rm -f "${output_dir}/package.json.orig"
-  cd "${output_dir}"
-
-  # 剔除 patch 允许改写的 package.json 与组装新增的 bundled yuku-core，其余须逐字节一致
-  find . -type f -exec sha256sum {} + | sed 's|\./||' | sort >"${work_dir}/after.sha256"
-  grep -v '  package\.json$' "${work_dir}/before.sha256" >"${work_dir}/before.filtered"
-  grep -v -e '  package\.json$' -e '  node_modules/' \
-    "${work_dir}/after.sha256" >"${work_dir}/after.filtered"
-  diff "${work_dir}/before.filtered" "${work_dir}/after.filtered"
-
-  # 容器 node 报 openharmony，这次 parse 走的是真实 yuku-core loader 的包内 binding
-  node --input-type=module -e '
-      import { parse, TokenKind } from "./index.js";
-      const result = parse("const answer: number = 40 + 2;", { path: "sample.ts" });
-      const declaration = result.program?.body?.[0];
-      if (result.program?.type !== "Program") throw new Error("parse did not return a Program");
-      if (declaration?.type !== "VariableDeclaration" || declaration.kind !== "const") throw new Error("unexpected declaration");
-      if (result.diagnostics.length !== 0) throw new Error(`unexpected diagnostics: ${result.diagnostics.length}`);
-      if (TokenKind.Const === undefined) throw new Error("TokenKind export is missing");
-      console.log("loader smoke:", result.program.type, declaration.type, declaration.kind);
-    '
-
-  cd "${work_dir}"
-  rm -rf "${stage_dir}"
-  rm -f "${work_dir}"/before.sha256 "${work_dir}"/after.sha256 \
-    "${work_dir}"/before.filtered "${work_dir}/after.filtered"
-  test -d "${output_dir}"
-
-  echo "OK: @ohos-npm-ports/${pkgname} ${version} built and smoke-tested"
+  async test() {
+    const api = await importPackage('yuku-parser');
+    const result = api.parse('const answer: number = 40 + 2;', { path: 'sample.ts' });
+    const declaration = result.program?.body?.[0];
+    assert.equal(result.program?.type, 'Program');
+    assert.equal(declaration?.type, 'VariableDeclaration');
+    assert.equal(declaration.kind, 'const');
+    assert.equal(result.diagnostics.length, 0);
+    assert.notEqual(api.TokenKind.Const, undefined);
+    return { result: { parse: true, diagnostics: true, tokenKind: true }, assets: [] };
+  }
 }

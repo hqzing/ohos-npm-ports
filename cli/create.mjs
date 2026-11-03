@@ -7,32 +7,36 @@ import { discoverPorts } from './port.mjs';
 import { parseSemver } from './semver.mjs';
 
 function render({ pkgname, upstream, version, source, sha256 }) {
-  return `${[
-    '#!/usr/bin/env bash',
-    `pkgname="${pkgname}"`,
-    `upstream="${upstream}"`,
-    `version="${version}"`,
-    'revision=1',
-    `source="${source}"`,
-    `sha256="${sha256}"`,
-    'dist_tag="latest"',
-    '',
-    'packages=("build/${pkgname}-${version}")',
-    '',
-    'prepare() {',
-    '  rm -rf build',
-    '  mkdir -p build',
-    '  fetch_source build/upstream.tgz',
-    '  mkdir -p "build/${pkgname}-${version}"',
-    '  tar -xzf build/upstream.tgz -C "build/${pkgname}-${version}" --strip-components=1',
-    '}',
-    '',
-    'build() {',
-    '  cd "build/${pkgname}-${version}"',
-    '  # Add OpenHarmony patches and build steps here.',
-    '}',
-    '',
-  ].join('\n')}`;
+  const className = pkgname.split(/[^A-Za-z0-9]/).filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1)).join('');
+  return `#!/usr/bin/env node
+import { Port, run, cd, fetchSource } from '../../../cli/recipe.mjs';
+import { mkdirSync, rmSync } from 'node:fs';
+
+const version = '${version}';
+
+export default class ${className} extends Port {
+  static pkgname = '${pkgname}';
+  static upstream = '${upstream}';
+  static version = version;
+  static revision = 1;
+  static source = \`${source}\`;
+  static sha256 = '${sha256}';
+  static distTag = 'latest';
+  static packages = [\`build/${pkgname}-\${version}\`];
+
+  prepare() {
+    rmSync('build', { recursive: true, force: true });
+    mkdirSync(\`build/${pkgname}-\${version}\`, { recursive: true });
+    fetchSource('build/upstream.tgz');
+    run('tar', ['-xzf', 'build/upstream.tgz', '-C', \`build/${pkgname}-\${version}\`, '--strip-components=1']);
+  }
+
+  build() {
+    cd(\`build/${pkgname}-\${version}\`);
+    // Add OpenHarmony patches and build steps here.
+  }
+}
+`;
 }
 
 export async function createPort(root, upstream, {

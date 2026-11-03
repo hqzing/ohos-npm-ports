@@ -125,11 +125,11 @@ test('AI containers configure PATH and use the documented npm-ports command', ()
   const repair = script.slice(script.indexOf('function repair'), script.indexOf('function stageRepair'));
   const verify = script.slice(script.indexOf('function verify'), script.indexOf('function comment'));
   assert.match(prompt, /npm-ports lint \$\{state\.portDirectory\}/);
-  assert.match(prompt, /npm-ports check \$\{state\.portDirectory\}/);
+  assert.match(prompt, /npm-ports package \$\{state\.portDirectory\}/);
   assert.doesNotMatch(prompt, /cli\/npm-ports/);
   assert.match(repair, /export PATH="\/workspace\/cli:\$PATH"/);
   assert.match(verify, /export PATH="\/workspace\/cli:\$PATH"/);
-  assert.match(verify, /npm-ports lint "\$1" && npm-ports check "\$1"/);
+  assert.match(verify, /npm-ports lint "\$1" && npm-ports package "\$1"/);
 });
 
 test('AI restores report ownership before the host reads it', () => {

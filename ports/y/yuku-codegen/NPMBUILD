@@ -1,140 +1,112 @@
-#!/usr/bin/env bash
-pkgname="yuku-codegen"
-upstream="yuku-codegen"
-version="0.19.0"
-revision=1
-source="https://registry.npmjs.org/${pkgname}/-/${pkgname}-${version}.tgz"
-sha256="c836e4666aa8db2c64f87c433d26cf14d35ce3c02061722bc9b4e4770e7f2491"
-dist_tag="latest"
-
-packages=(
-  "yuku-codegen-${version}"
-)
-work_dir="$NPMBUILD_DIR"
-stage_dir="${work_dir}/build"
-output_dir="${work_dir}/${pkgname}-${version}"
-
-prepare() {
-  # ============================================================
-  # ohos-npm-ports: @ohos-npm-ports/yuku-codegen ${version}
-  #
-  # 构建方式：
-  #   1. 下载官方 yuku-codegen@${version} tarball，钉住 sha256
-  #   2. 上游自 0.19.0 起改为纯 JavaScript 实现，tarball 已带编译好的 dist，
-  #      不再有 napi binding、optionalDependencies 或 yuku monorepo 构建步骤
-  #   3. 零依赖重打包：上游全部内容原样进发布目录
-  #   4. 用真实 ESM 入口做 generate/minify/source map 冒烟
-  #
-  # 0.19.0 的 codegen 本身不含原生二进制，因此无需槽位包或交叉编译。
-  #
-  # 发布目录名必须与 NPMBUILD packages 一致，并留在配方目录根下，
-  # 所以中间件放 STAGE，成品由 package() 落到 OUT，check() 不删 OUT。
-  # ============================================================
-
-  # ===== fetch =====
-  echo "=== fetch: 官方 ${pkgname}@${version} ==="
-  rm -rf "${stage_dir}"
-  mkdir -p "${stage_dir}"
-  cd "${stage_dir}"
-
-  fetch_source src.tgz
-  tar -zxf src.tgz
-  rm src.tgz
-  mv package src
-}
-
-build() {
-  echo "=== build: 校验纯 JS 产物 ==="
-  cd "${stage_dir}/src"
-
-  find . -type f -exec sha256sum {} + | sed 's|\./||' | sort >"${work_dir}/before.sha256"
-
-  grep -q "\"version\": \"${version}\"" package.json
-
-  # 0.19.0 发布 tarball 已包含 dist，不需要再跑 tsc 或编译原生模块
-  test -f dist/index.js
-  test -f dist/index.d.ts
-  node --check dist/index.js
-}
-
-package() {
-  echo "=== package: 组装发布目录 + manifest 断言 ==="
-  rm -rf "${output_dir}"
-  cp -a "${stage_dir}/src" "${output_dir}"
-
-  cd "${output_dir}"
-  node -e '
-      const p = require("./package.json");
-      if (p.version !== process.argv[1]) { console.error("bad version: " + p.version); process.exit(1); }
-      if (p.main !== "./dist/index.js") { console.error("bad main: " + p.main); process.exit(1); }
-      if (p.optionalDependencies || p.dependencies?.["@yuku-codegen/binding-openharmony-arm64"]) {
-        console.error("stale native binding metadata");
-        process.exit(1);
-      }
-      console.log("OK: manifest");
-    ' "${version}"
-}
-
-check() {
-  echo "=== test: 哈希不变量 + 真实 ESM 冒烟 ==="
-  rm -f "${output_dir}/package.json.orig"
-  cd "${output_dir}"
-
-  # 剔除 patch 允许改写的 package.json，其余须逐字节一致
-  find . -type f -exec sha256sum {} + | sed 's|\./||' | sort >"${work_dir}/after.sha256"
-  grep -v '  package\.json$' "${work_dir}/before.sha256" >"${work_dir}/before.filtered"
-  grep -v '  package\.json$' "${work_dir}/after.sha256" >"${work_dir}/after.filtered"
-  diff "${work_dir}/before.filtered" "${work_dir}/after.filtered"
-
-  # 走包的真实 ESM 入口，覆盖格式化、压缩与 source map 三条路径
-  node --input-type=module - <<'JS'
+#!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { generate } from './dist/index.js';
+import { createHash } from 'node:crypto';
+import { Port, run, cd, fetchSource, readJson, writeJson, importPackage } from '../../../cli/recipe.mjs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
-const ast = {
-  type: 'Program',
-  sourceType: 'module',
-  start: 0,
-  end: 6,
-  body: [{
-    type: 'ExpressionStatement',
-    start: 0,
-    end: 6,
-    expression: {
-      type: 'BinaryExpression',
-      operator: '+',
+const version = '0.19.0';
+const rootDir = import.meta.dirname;
+const stageDir = join(rootDir, 'build');
+const sourceDir = join(stageDir, 'src');
+const outputDir = join(rootDir, `yuku-codegen-${version}`);
+
+function hashTree(directory) {
+  const hashes = {};
+  function walk(current, prefix = '') {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const name = prefix + entry.name;
+      const file = join(current, entry.name);
+      if (entry.isDirectory()) walk(file, `${name}/`);
+      else if (entry.isFile()) hashes[name] = createHash('sha256').update(readFileSync(file)).digest('hex');
+    }
+  }
+  walk(directory);
+  return Object.fromEntries(Object.entries(hashes).sort((left, right) => left[0].localeCompare(right[0])));
+}
+
+export default class YukuCodegen extends Port {
+  static pkgname = 'yuku-codegen';
+  static upstream = 'yuku-codegen';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static source = `https://registry.npmjs.org/yuku-codegen/-/yuku-codegen-${version}.tgz`;
+  static sha256 = 'c836e4666aa8db2c64f87c433d26cf14d35ce3c02061722bc9b4e4770e7f2491';
+  static packages = [`yuku-codegen-${version}`];
+
+  prepare() {
+    rmSync(stageDir, { recursive: true, force: true });
+    mkdirSync(stageDir, { recursive: true });
+    cd(stageDir);
+    fetchSource(join(stageDir, 'src.tgz'));
+    run('tar', ['-zxf', join(stageDir, 'src.tgz'), '-C', stageDir]);
+    rmSync(join(stageDir, 'src.tgz'), { force: true });
+    renameSync(join(stageDir, 'package'), sourceDir);
+  }
+
+  build() {
+    cd(sourceDir);
+    writeJson(join(stageDir, 'before-hashes.json'), hashTree(sourceDir));
+    assert.equal(readJson(join(sourceDir, 'package.json')).version, version);
+    assert.ok(statSync(join(sourceDir, 'dist/index.js')).size > 0);
+    assert.ok(statSync(join(sourceDir, 'dist/index.d.ts')).size > 0);
+    run(process.execPath, ['--check', join(sourceDir, 'dist/index.js')]);
+  }
+
+  package() {
+    rmSync(outputDir, { recursive: true, force: true });
+    cpSync(sourceDir, outputDir, { recursive: true });
+    const pkg = readJson(join(outputDir, 'package.json'));
+    assert.equal(pkg.version, version);
+    assert.equal(pkg.main, './dist/index.js');
+    assert.ok(!pkg.optionalDependencies);
+    assert.ok(!pkg.dependencies?.['@yuku-codegen/binding-openharmony-arm64']);
+    rmSync(join(outputDir, 'package.json.orig'), { force: true });
+    const before = readJson(join(stageDir, 'before-hashes.json'));
+    const after = hashTree(outputDir);
+    const beforeFiles = Object.fromEntries(Object.entries(before).filter(entry => entry[0] !== 'package.json'));
+    const afterFiles = Object.fromEntries(Object.entries(after).filter(entry => entry[0] !== 'package.json'));
+    assert.deepEqual(afterFiles, beforeFiles);
+    rmSync(stageDir, { recursive: true, force: true });
+    assert.ok(existsSync(outputDir));
+  }
+
+  static testTimeout = 600_000;
+
+  async test() {
+    const { generate } = await importPackage('yuku-codegen');
+    const ast = {
+      type: 'Program',
+      sourceType: 'module',
       start: 0,
-      end: 5,
-      left: { type: 'Literal', value: 1, start: 0, end: 1 },
-      right: { type: 'Literal', value: 2, start: 4, end: 5 },
-    },
-  }],
-};
-
-const pretty = generate(ast);
-assert.equal(pretty.code, '1 + 2;');
-assert.deepEqual(pretty.diagnostics, []);
-assert.equal(pretty.map, null);
-
-const compact = generate(ast, { minify: true });
-assert.equal(compact.code, '1+2');
-
-const mapped = generate(ast, {
-  sourceMap: { source: '1 + 2;', file: 'out.js', sourceFileName: 'in.js' },
-});
-assert.equal(mapped.code, '1 + 2;');
-assert.equal(mapped.map.version, 3);
-assert.equal(mapped.map.file, 'out.js');
-assert.deepEqual(mapped.map.sources, ['in.js']);
-assert.ok(mapped.map.mappings.length > 0);
-console.log('codegen smoke:', pretty.code, '| minified:', compact.code);
-JS
-
-  cd "${work_dir}"
-  rm -rf "${stage_dir}"
-  rm -f "${work_dir}"/before.sha256 "${work_dir}"/after.sha256 \
-    "${work_dir}"/before.filtered "${work_dir}/after.filtered"
-  test -d "${output_dir}"
-
-  echo "OK: @ohos-npm-ports/${pkgname} ${version} built and smoke-tested"
+      end: 6,
+      body: [{
+        type: 'ExpressionStatement',
+        start: 0,
+        end: 6,
+        expression: {
+          type: 'BinaryExpression',
+          operator: '+',
+          start: 0,
+          end: 5,
+          left: { type: 'Literal', value: 1, start: 0, end: 1 },
+          right: { type: 'Literal', value: 2, start: 4, end: 5 },
+        },
+      }],
+    };
+    const pretty = generate(ast);
+    assert.equal(pretty.code, '1 + 2;');
+    assert.deepEqual(pretty.diagnostics, []);
+    assert.equal(pretty.map, null);
+    const compact = generate(ast, { minify: true });
+    assert.equal(compact.code, '1+2');
+    const mapped = generate(ast, { sourceMap: { source: '1 + 2;', file: 'out.js', sourceFileName: 'in.js' } });
+    assert.equal(mapped.code, '1 + 2;');
+    assert.equal(mapped.map.version, 3);
+    assert.equal(mapped.map.file, 'out.js');
+    assert.deepEqual(mapped.map.sources, ['in.js']);
+    assert.ok(mapped.map.mappings.length > 0);
+    return { result: { format: true, minify: true, sourceMap: true }, assets: [] };
+  }
 }

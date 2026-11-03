@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26.13.0'
       - id: ports
         env:
           SELECTED: ${{ inputs.port }}
@@ -59,7 +59,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26.13.0'
       - name: Bump one port and create an ordinary PR unless one is already open
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseSemver } from './semver.mjs';
 
 export const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const runtime = fileURLToPath(new URL('./runtime.sh', import.meta.url));
+const metadataLoader = fileURLToPath(new URL('./recipe-metadata.mjs', import.meta.url));
 
 export function findRoot(start = process.cwd()) {
   if (process.env.NPM_PORTS_ROOT) return resolve(process.env.NPM_PORTS_ROOT);
@@ -41,59 +41,17 @@ export function discoverPorts(root) {
   }).sort();
 }
 
-const readScript = [
-  'set -euo pipefail',
-  'export NPMBUILD_DIR="$1"',
-  'source "$NPM_PORTS_RUNTIME"',
-  'source "$NPMBUILD_DIR/NPMBUILD" >&2',
-  ': "${pkgname:?pkgname is required}"',
-  ': "${upstream:?upstream is required}"',
-  ': "${version:?version is required}"',
-  ': "${revision:?revision is required}"',
-  ': "${dist_tag:?dist_tag is required}"',
-  'if ! declare -F build >/dev/null; then',
-  "  echo 'build() is required' >&2",
-  '  exit 65',
-  'fi',
-  'printf \'%s\\0\' "$pkgname" "$upstream" "$version" "$revision" "$dist_tag" \\',
-  '  "${upstream_tag:-latest}" "${source:-}" "${sha256:-}" "${bump:-true}"',
-  'printf \'%s\\0\' "${#packages[@]}"',
-  'for output in "${packages[@]}"; do printf \'%s\\0\' "$output"; done',
-  'printf \'%s\\0\' "${#resource_names[@]}"',
-  'if [ "${#resource_names[@]}" -gt 0 ]; then',
-  '  for resource_name in "${resource_names[@]}"; do',
-  '    url_variable="resource_${resource_name}_url"',
-  '    sha_variable="resource_${resource_name}_sha256"',
-  '    printf \'%s\\0\' "$resource_name" "${!url_variable}" "${!sha_variable}"',
-  '  done',
-  'fi',
-].join('\n');
-
 export function loadPort(root, input) {
   const dir = portPath(root, input);
-  const output = execFileSync('bash', ['-c', readScript, 'npm-ports', dir], {
+  const metadata = JSON.parse(execFileSync(process.execPath, [metadataLoader, dir], {
     cwd: dir,
-    env: { ...process.env, NPMBUILD_DIR: dir, NPM_PORTS_RUNTIME: runtime },
+    env: { ...process.env, NPMBUILD_DIR: dir },
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
-  });
-  const fields = output.split('\0');
-  const [pkgname, upstream, version, revisionText, distTag, upstreamTag, source, sha256, bump, countText] = fields;
-  const count = Number(countText);
-  if (!Number.isInteger(count) || count < 1 || fields.length < 12 + count) throw new Error(`Invalid packages array: ${dir}`);
-  const resourceOffset = 10 + count;
-  const resourceCount = Number(fields[resourceOffset]);
-  if (!Number.isInteger(resourceCount) || resourceCount < 0 || fields.length !== 12 + count + resourceCount * 3) {
-    throw new Error(`Invalid resources array: ${dir}`);
-  }
-  const resources = [];
-  for (let index = 0; index < resourceCount; index += 1) {
-    const offset = resourceOffset + 1 + index * 3;
-    resources.push({ name: fields[offset], url: fields[offset + 1], sha256: fields[offset + 2] });
-  }
+  }));
   const packages = [];
   const packageNames = [];
-  for (const declaration of fields.slice(10, 10 + count)) {
+  for (const declaration of metadata.packages) {
     const separator = declaration.indexOf(':');
     const packageName = separator === -1 ? '' : declaration.slice(0, separator);
     const output = separator === -1 ? declaration : declaration.slice(separator + 1);
@@ -112,19 +70,20 @@ export function loadPort(root, input) {
     versionLine,
     dir,
     relative: relative(root, dir).split(sep).join('/'),
-    pkgname,
-    upstream,
-    version,
-    revision: Number(revisionText),
-    portVersion: `${version}-${revisionText}`,
-    distTag,
-    upstreamTag,
-    source,
-    sha256,
-    bump: bump !== 'false',
+    pkgname: metadata.pkgname,
+    upstream: metadata.upstream,
+    version: metadata.version,
+    revision: Number(metadata.revision),
+    portVersion: `${metadata.version}-${metadata.revision}`,
+    distTag: metadata.distTag,
+    upstreamTag: metadata.upstreamTag,
+    source: metadata.source,
+    sha256: metadata.sha256,
+    bump: metadata.bump !== false,
     packages,
     packageNames,
-    resources,
+    resources: metadata.resources,
+    test: metadata.test,
   };
   validatePort(port);
   return port;

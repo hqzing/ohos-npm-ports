@@ -5,12 +5,13 @@ import { test } from 'node:test';
 const bump = readFileSync('.github/workflows/bump.yml', 'utf8');
 const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
 const lint = readFileSync('.github/workflows/port-lint.yml', 'utf8');
-const runtime = readFileSync('cli/runtime.sh', 'utf8');
+const recipe = readFileSync('cli/recipe.mjs', 'utf8');
 const portLoader = readFileSync('cli/port.mjs', 'utf8');
 
-test('resource metadata stays compatible with the macOS Bash 3.2 runtime', () => {
-  assert.doesNotMatch(runtime, /^declare\s+-\w*g\w*\s/m);
-  assert.match(portLoader, /if \[ "\$\{#resource_names\[@\]\}" -gt 0 \]; then/);
+test('recipes use ESM classes and synchronous helpers by default', () => {
+  assert.match(recipe, /export class Port/);
+  assert.match(recipe, /spawnSync\(command, args/);
+  assert.match(portLoader, /recipe-metadata\.mjs/);
 });
 
 test('bump uses the single-port command without a third-party PR action', () => {

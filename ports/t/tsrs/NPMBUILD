@@ -1,110 +1,216 @@
-#!/usr/bin/env bash
-pkgname="tsrs"
-upstream="tsrs"
-version="0.18.0-ts7.1.0-dev.20260929"
-revision=4
-# npm prerelease 与源码 tag 无可靠映射，禁用自动 bump。
-bump=false
-source="https://registry.npmjs.org/tsrs/-/tsrs-${version}.tgz"
-sha256="8a07eaa884fc4841b856dbad44eee825c0b9ed7c607c35ef74c7a0223d98ba18"
-resource "rust" \
-  "https://static.rust-lang.org/dist/rust-1.99.1-aarch64-unknown-linux-ohos.tar.xz" \
-  "4b078f77667e497d93f850c0f91ffbb39b764c3e51a2229db9de3f5b595385a3"
-resource "source_tag" \
-  "https://codeload.github.com/oxc-project/tsrs/tar.gz/refs/tags/v0.18.0" \
-  "d9a08890fb9b60442e4ae1a9a90b987daef7f3429afb2153cf8ebff635f7fcd6"
-dist_tag="latest"
-
-packages=(
-  "@ohos-npm-ports/tsrs-openharmony-arm64:build/native"
-  "build/main"
-)
-
-work_dir="$NPMBUILD_DIR"
-build_dir="$work_dir/build"
-
-prepare() {
-  brew install -y cmake openssl@3 zlib-ng-compat libxml2
-  mkdir -p "$build_dir"
-  fetch_resource "rust" "$build_dir/rust.tar.xz"
-  if [ ! -x "$build_dir/rust/bin/rustc" ]; then
-    tar -xJf "$build_dir/rust.tar.xz" -C "$build_dir"
-    sh "$build_dir/rust-1.99.1-aarch64-unknown-linux-ohos/install.sh" \
-      --prefix="$build_dir/rust" --disable-ldconfig \
-      --components=rustc,cargo,rust-std-aarch64-unknown-linux-ohos
-  fi
-  export PATH="$build_dir/rust/bin:$PATH"
-  export LD_LIBRARY_PATH="$(brew --prefix openssl@3)/lib:$(brew --prefix zlib-ng-compat)/lib:$(brew --prefix libxml2)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  export CARGO_HTTP_CAINFO="$(brew --prefix)/etc/openssl@3/cert.pem"
-  rustc --version
-
-  fetch_resource "source_tag" "$build_dir/source.tar.gz"
-  fetch_source "$build_dir/npm.tgz"
-  if [ ! -d "$build_dir/tsrs-0.18.0" ]; then
-    tar -xzf "$build_dir/source.tar.gz" -C "$build_dir"
-  fi
-}
-
-build() {
-  (cd "$build_dir/tsrs-0.18.0" && cargo test --locked -p tsrs_core --features plain-ptrs --lib)
-  # HarmonyOS cannot reserve the default compressed-pointer arena address.
-  (cd "$build_dir/tsrs-0.18.0" && cargo build --release --locked -p tsrs_cli --features noembed,tsrs_core/plain-ptrs)
-}
-
-package() {
-  rm -rf "$build_dir/main" "$build_dir/native"
-  mkdir -p "$build_dir/main" "$build_dir/native"
-  tar -xzf "$build_dir/npm.tgz" -C "$build_dir/main" --strip-components=1
-  cp "$build_dir/tsrs-0.18.0/target/release/tsrs" "$build_dir/native/tsrs"
-  cp "$build_dir/tsrs-0.18.0/crates/tsrs_vfs/libs/"*.d.ts "$build_dir/native/"
-  cp "$build_dir/tsrs-0.18.0/LICENSE" "$build_dir/tsrs-0.18.0/NOTICE" "$build_dir/native/"
-  chmod +x "$build_dir/native/tsrs"
-  build_dir="$build_dir" version="$version" node --input-type=module <<'JS'
-import fs from 'node:fs';
-const {build_dir: root, version} = process.env;
-const file = `${root}/main/package.json`;
-const pkg = JSON.parse(fs.readFileSync(file));
-pkg.optionalDependencies['@tsrs/openharmony-arm64'] = `npm:@ohos-npm-ports/tsrs-openharmony-arm64@${version}`;
-fs.writeFileSync(file, JSON.stringify(pkg, null, 2)+'\n');
-fs.writeFileSync(`${root}/native/package.json`, JSON.stringify({
- version,
- license:pkg.license, os:['openharmony'], cpu:['arm64'],
- exports:{'./package.json':'./package.json'}, files:['tsrs','*.d.ts','LICENSE','NOTICE'],
-},null,2)+'\n');
-JS
-}
-
-check() {
-  package_version=$(node -p "require('${build_dir}/main/package.json').version")
-  build_dir="$build_dir" node --input-type=module <<'JS'
-import fs from 'node:fs';
+#!/usr/bin/env node
 import assert from 'node:assert/strict';
-import {execFileSync} from 'node:child_process';
-const root=process.env.build_dir;
-fs.mkdirSync(`${root}/original`, {recursive:true});
-execFileSync('tar',['-xzf',`${root}/npm.tgz`,'-C',`${root}/original`,'--strip-components=1']);
-function walk(dir, prefix='') {
- for (const e of fs.readdirSync(dir,{withFileTypes:true})) {
-  const name=prefix+e.name;
-  if(e.isDirectory()) walk(`${dir}/${e.name}`,name+'/');
-  else if(name!=='package.json') assert.deepEqual(fs.readFileSync(`${dir}/${e.name}`),fs.readFileSync(`${root}/main/${name}`),name);
- }
+import { Port, resource, run, cd, fetchSource, fetchResource, readJson, writeJson, requirePackage, importPackage, recipeContext } from '../../../cli/recipe.mjs';
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const version = '0.18.0-ts7.1.0-dev.20260929';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const sourceDir = join(buildDir, 'tsrs-0.18.0');
+const mainDir = join(buildDir, 'main');
+const nativeDir = join(buildDir, 'native');
+
+function executable(file) {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
-walk(`${root}/original`);
-const old=JSON.parse(fs.readFileSync(`${root}/original/package.json`));
-const pkg=JSON.parse(fs.readFileSync(`${root}/main/package.json`));
-for(const [name,v] of Object.entries(old.optionalDependencies)) assert.equal(pkg.optionalDependencies[name],v);
-for(const k of ['name','version','repository','optionalDependencies']) {delete old[k];delete pkg[k];}
-assert.deepEqual(pkg,old);
-JS
-  (cd "$build_dir/native" && npm pack --pack-destination "$build_dir")
-  (cd "$build_dir/main" && npm pack --pack-destination "$build_dir")
-  rm -rf "$build_dir/consumer"
-  mkdir -p "$build_dir/consumer"
-  (cd "$build_dir/consumer" && npm init -y && npm install --force --ignore-scripts --omit=optional \
-    "tsrs@file:$build_dir/ohos-npm-ports-tsrs-$package_version.tgz" \
-    "@tsrs/openharmony-arm64@file:$build_dir/ohos-npm-ports-tsrs-openharmony-arm64-$package_version.tgz")
-  node "$work_dir/smoke.mjs" "$build_dir/consumer"
-  cp "$build_dir/tsrs-0.18.0/npm/sdk/smoke/consumer.mjs" "$build_dir/consumer/upstream-smoke.mjs"
-  (cd "$build_dir/consumer" && timeout 180 node upstream-smoke.mjs "$build_dir/consumer/api-fixture")
+
+function verifyPackageFiles() {
+  const originalDir = join(buildDir, 'original');
+  rmSync(originalDir, { recursive: true, force: true });
+  mkdirSync(originalDir, { recursive: true });
+  run('tar', ['-xzf', join(buildDir, 'npm.tgz'), '-C', originalDir, '--strip-components=1']);
+  function walk(directory, prefix = '') {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const name = prefix + entry.name;
+      if (entry.isDirectory()) walk(join(directory, entry.name), `${name}/`);
+      else if (name !== 'package.json') assert.deepEqual(readFileSync(join(directory, entry.name)), readFileSync(join(mainDir, name)), name);
+    }
+  }
+  walk(originalDir);
+  const original = readJson(join(originalDir, 'package.json'));
+  const pkg = readJson(join(mainDir, 'package.json'));
+  for (const [name, value] of Object.entries(original.optionalDependencies)) assert.equal(pkg.optionalDependencies[name], value);
+  assert.equal(pkg.optionalDependencies['@tsrs/openharmony-arm64'], `npm:@ohos-npm-ports/tsrs-openharmony-arm64@${version}`);
+  for (const key of ['name', 'version', 'repository', 'optionalDependencies']) {
+    delete original[key];
+    delete pkg[key];
+  }
+  assert.deepEqual(pkg, original);
+  assert.ok(statSync(join(nativeDir, 'tsrs')).size > 0);
+  assert.ok(statSync(join(nativeDir, 'lib.es5.d.ts')).size > 0);
+}
+
+export default class Tsrs extends Port {
+  static pkgname = 'tsrs';
+  static upstream = 'tsrs';
+  static version = version;
+  static revision = 4;
+  static distTag = 'latest';
+  static bump = false;
+  static source = `https://registry.npmjs.org/tsrs/-/tsrs-${version}.tgz`;
+  static sha256 = '8a07eaa884fc4841b856dbad44eee825c0b9ed7c607c35ef74c7a0223d98ba18';
+  static resources = [
+    resource(
+      'rust',
+      'https://static.rust-lang.org/dist/rust-1.99.1-aarch64-unknown-linux-ohos.tar.xz',
+      '4b078f77667e497d93f850c0f91ffbb39b764c3e51a2229db9de3f5b595385a3',
+    ),
+    resource(
+      'source_tag',
+      'https://codeload.github.com/oxc-project/tsrs/tar.gz/refs/tags/v0.18.0',
+      'd9a08890fb9b60442e4ae1a9a90b987daef7f3429afb2153cf8ebff635f7fcd6',
+    ),
+  ];
+  static packages = [
+    '@ohos-npm-ports/tsrs-openharmony-arm64:build/native',
+    'build/main',
+  ];
+
+  prepare() {
+    run('brew', ['install', '-y', 'cmake', 'openssl@3', 'zlib-ng-compat', 'libxml2']);
+    mkdirSync(buildDir, { recursive: true });
+    fetchResource('rust', join(buildDir, 'rust.tar.xz'));
+    if (!executable(join(buildDir, 'rust/bin/rustc'))) {
+      run('tar', ['-xJf', join(buildDir, 'rust.tar.xz'), '-C', buildDir]);
+      run('sh', [
+        join(buildDir, 'rust-1.99.1-aarch64-unknown-linux-ohos/install.sh'),
+        `--prefix=${join(buildDir, 'rust')}`,
+        '--disable-ldconfig',
+        '--components=rustc,cargo,rust-std-aarch64-unknown-linux-ohos',
+      ]);
+    }
+    process.env.PATH = `${join(buildDir, 'rust/bin')}:${process.env.PATH}`;
+    const openssl = run('brew', ['--prefix', 'openssl@3'], { capture: true }).stdout.trim();
+    const zlib = run('brew', ['--prefix', 'zlib-ng-compat'], { capture: true }).stdout.trim();
+    const libxml2 = run('brew', ['--prefix', 'libxml2'], { capture: true }).stdout.trim();
+    const brewPrefix = run('brew', ['--prefix'], { capture: true }).stdout.trim();
+    const libraries = [join(openssl, 'lib'), join(zlib, 'lib'), join(libxml2, 'lib')];
+    if (process.env.LD_LIBRARY_PATH) libraries.push(process.env.LD_LIBRARY_PATH);
+    process.env.LD_LIBRARY_PATH = libraries.join(':');
+    process.env.CARGO_HTTP_CAINFO = join(brewPrefix, 'etc/openssl@3/cert.pem');
+    run('rustc', ['--version']);
+
+    fetchResource('source_tag', join(buildDir, 'source.tar.gz'));
+    fetchSource(join(buildDir, 'npm.tgz'));
+    if (!existsSync(sourceDir)) run('tar', ['-xzf', join(buildDir, 'source.tar.gz'), '-C', buildDir]);
+  }
+
+  build() {
+    cd(sourceDir);
+    run('cargo', ['test', '--locked', '-p', 'tsrs_core', '--features', 'plain-ptrs', '--lib']);
+    run('cargo', ['build', '--release', '--locked', '-p', 'tsrs_cli', '--features', 'noembed,tsrs_core/plain-ptrs']);
+  }
+
+  package() {
+    rmSync(mainDir, { recursive: true, force: true });
+    rmSync(nativeDir, { recursive: true, force: true });
+    mkdirSync(mainDir, { recursive: true });
+    mkdirSync(nativeDir, { recursive: true });
+    run('tar', ['-xzf', join(buildDir, 'npm.tgz'), '-C', mainDir, '--strip-components=1']);
+    copyFileSync(join(sourceDir, 'target/release/tsrs'), join(nativeDir, 'tsrs'));
+    for (const file of readdirSync(join(sourceDir, 'crates/tsrs_vfs/libs'))) {
+      if (file.endsWith('.d.ts')) copyFileSync(join(sourceDir, 'crates/tsrs_vfs/libs', file), join(nativeDir, file));
+    }
+    copyFileSync(join(sourceDir, 'LICENSE'), join(nativeDir, 'LICENSE'));
+    copyFileSync(join(sourceDir, 'NOTICE'), join(nativeDir, 'NOTICE'));
+    chmodSync(join(nativeDir, 'tsrs'), 0o755);
+    const manifestFile = join(mainDir, 'package.json');
+    const pkg = readJson(manifestFile);
+    pkg.optionalDependencies['@tsrs/openharmony-arm64'] = `npm:@ohos-npm-ports/tsrs-openharmony-arm64@${version}`;
+    writeJson(manifestFile, pkg);
+    writeJson(join(nativeDir, 'package.json'), {
+      version,
+      license: pkg.license,
+      os: ['openharmony'],
+      cpu: ['arm64'],
+      exports: { './package.json': './package.json' },
+      files: ['tsrs', '*.d.ts', 'LICENSE', 'NOTICE'],
+    });
+    verifyPackageFiles();
+  }
+
+  static testTimeout = 600_000;
+
+  async test() {
+    const context = recipeContext();
+    const pkg = requirePackage('tsrs/package.json');
+    if (context.mode !== 'baseline') {
+      assert.equal(pkg.name, '@ohos-npm-ports/tsrs');
+      assert.equal(pkg.version, context.portVersion);
+    }
+    const packageFile = context.resolvePackage('tsrs/package.json');
+    const packageRoot = dirname(packageFile);
+    const cli = join(packageRoot, 'bin/tsrs');
+    if (process.platform === 'win32') {
+      const unsupported = run(process.execPath, [cli, '--version'], { capture: true, allowExitCodes: [1] });
+      const output = unsupported.stdout + unsupported.stderr;
+      assert.match(output, /Cannot find the optional dependency @tsrs\/win32-x64/);
+      assert.match(output, /This platform is not supported/);
+      const metadata = await importPackage('tsrs');
+      assert.match(metadata.version, /^0\.18\.0-/);
+      return { result: { nativeSupport: false, unsupportedPlatformDiagnostic: true, metadata: true }, assets: [] };
+    }
+
+    const fixture = mkdtempSync(join(context.projectDir, '.tsrs-test-'));
+    try {
+      const config = join(fixture, 'tsconfig.json');
+      const probe = join(fixture, 'probe.ts');
+      writeFileSync(config, JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [] }, files: ['probe.ts'] }));
+      writeFileSync(probe, 'const answer: number = 42;');
+      run(process.execPath, [cli, '--project', config], { cwd: fixture });
+      writeFileSync(probe, 'const answer: number = "wrong";');
+      const invalid = run(process.execPath, [cli, '--project', config], { cwd: fixture, capture: true, allowExitCodes: [2] });
+      assert.match(invalid.stdout + invalid.stderr, /TS2322/);
+
+      const platform = await import(pathToFileURL(join(packageRoot, 'lib/platform.js')).href);
+      assert.equal(platform.getPlatformPackageName('openharmony', 'arm64'), '@tsrs/openharmony-arm64');
+      assert.equal(platform.getPlatformPackageName('darwin', 'arm64'), '@tsrs/darwin-arm64');
+      assert.equal(platform.getPlatformPackageName('win32', 'x64'), '@tsrs/win32-x64');
+      assert.match(platform.getPlatformPackageName('linux', 'arm64'), /^@tsrs\/linux-arm64-(gnu|musl)$/);
+      if (context.mode !== 'baseline' && process.platform === 'openharmony') {
+        const nativeFile = context.resolvePackage('@tsrs/openharmony-arm64/package.json');
+        assert.equal(requirePackage('@tsrs/openharmony-arm64/package.json').version, pkg.version);
+        assert.ok(existsSync(join(dirname(nativeFile), 'tsrs')));
+        assert.ok(existsSync(join(dirname(nativeFile), 'lib.es5.d.ts')));
+      }
+
+      const sync = await importPackage('tsrs/unstable/sync');
+      const api = new sync.API({ cwd: fixture });
+      try {
+        const parsed = api.parseConfigFile(config);
+        assert.equal(parsed.fileNames.length, 1);
+      } finally {
+        api.close();
+      }
+      const asyncApi = await importPackage('tsrs/unstable/async');
+      const asyncAPI = new asyncApi.API({ cwd: fixture });
+      try {
+        const parsed = await asyncAPI.parseConfigFile(config);
+        assert.equal(parsed.fileNames.length, 1);
+      } finally {
+        await asyncAPI.close();
+      }
+
+      if (process.platform === 'openharmony') {
+        const smokeDir = mkdtempSync(join(context.projectDir, '.tsrs-upstream-'));
+        try {
+          const smoke = join(smokeDir, 'consumer.mjs');
+          copyFileSync(join(rootDir, 'tests/upstream-smoke.mjs'), smoke);
+          run(process.execPath, [smoke, join(fixture, 'api-fixture')], { cwd: fixture, timeout: 180_000 });
+        } finally {
+          rmSync(smokeDir, { recursive: true, force: true });
+        }
+      }
+      return { result: { valid: true, invalid: 'TS2322', syncAPI: true, asyncAPI: true }, assets: [] };
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
 }

@@ -1,157 +1,282 @@
-#!/usr/bin/env bash
-pkgname="playwright-core"
-upstream="playwright-core"
-version="1.64.1"
-revision=3
-source="https://codeload.github.com/microsoft/playwright/tar.gz/refs/tags/v${version}"
-sha256="4cf21457cd00395c83b29e7f787b72e8b3bb00cee14728c69ac80a12ae42f089"
-dist_tag="latest"
+#!/usr/bin/env node
+/*
+# playwright-core: local aa + TCP CDP
 
-packages=(
-  "build/playwright-core-${version}"
-)
-script_dir="$NPMBUILD_DIR"
-build_dir="$script_dir/build"
+This revision launches installed OpenHarmony browsers with the local `aa`
+command and connects directly to their TCP CDP endpoint. It does not install
+Chromium, use a device connector, forward ports or force-stop applications.
 
-prepare() {
-  mkdir -p "$build_dir"
-  cd "$build_dir"
+```js
+const { chromium } = require('@ohos-npm-ports/playwright-core');
+const browser = await chromium.launch({ channel: 'chrome' }); // installed Haitai
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto('http://127.0.0.1:3000');
+```
 
-  source_dir="playwright-$version"
-  artifact_dir="playwright-core-$version"
-  lightningcss_spec="@ohos-npm-ports/lightningcss@1.33.0-1"
-  cd "$build_dir"
-  echo "==> downloading playwright $version source"
-  fetch_source "$source_dir.tar.gz"
-  rm -rf "$source_dir"
-  tar -zxf "$source_dir.tar.gz"
-  rm "$source_dir.tar.gz"
-  cd "$source_dir"
+`chrome` selects `com.haitai.htbrowser` / `EntryAbility`. `aa` must be on PATH.
+`harmonyDebugPort`, `harmonyArgs` and `harmonyLaunchUrl` remain available.
+A missing command, a failed launch or an unavailable local CDP endpoint is an
+error, with no alternate backend. If an existing browser ignores new command
+arguments, save its work and close it manually before retrying.
+
+`huaweiBrowser` uses a Unix-domain debug socket and is no longer supported by
+`launch()`. Use an installed TCP CDP browser, or attach to an already available
+endpoint using `chromium.connectOverCDP()`.
+
+The `lib/ohos` entry exports `launchViaAa`, not `launchViaHdc`. `HdcBackend`,
+`hdcScreenshot`, `resolveOhosAa` and device screenshot fallback are removed.
+`takeScreenshot()` uses the page's CDP screenshot and propagates failures.
+`chromium.executablePath()` on OpenHarmony identifies `aa`, not a browser ELF.
+
+`browser.close()` / `browserServer.kill()` close the launched browser through CDP.
+Do not call these on a browser whose other windows you intend to preserve.
+Desktop platform launch behavior remains upstream behavior.
+*/
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+import { Port, run, cd, fetchSource, readJson, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+
+const version = '1.64.1';
+const rootDir = import.meta.dirname;
+const buildDir = join(rootDir, 'build');
+const sourceDir = join(buildDir, `playwright-${version}`);
+const artifactDir = join(buildDir, `playwright-core-${version}`);
+const lightningcssSpec = '@ohos-npm-ports/lightningcss@1.33.0-1';
+
+function filesBelow(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const file = join(directory, entry.name);
+    return entry.isDirectory() ? filesBelow(file) : entry.isFile() ? [file] : [];
+  });
 }
 
-build() {
-  cd "$build_dir/$source_dir"
-  echo "==> applying patches"
-  for patch in "$script_dir"/patches/*.patch; do
-    echo "patch -p1 < $(basename "$patch")"
-    patch -p1 <"$patch"
-  done
-
-  echo "==> verifying patch markers"
-  test -f packages/playwright-core/src/ohos/launcher.ts
-  grep -q 'harmonyBundleName' packages/protocol/spec/mixins.yml
-  grep -q "isOpenHarmony() ? resolveCommandPath('ffmpeg')" packages/playwright-core/src/server/registry/index.ts
-  grep -q 'ohosExecutablePath' packages/playwright-core/src/server/chromium/chromium.ts
-  grep -q 'browserProcess.onclose' packages/playwright-core/src/ohos/launcher.ts
-  grep -q 'launchViaAa' packages/playwright-core/src/ohos/launcher.ts
-  test ! -e packages/playwright-core/src/ohos/hdc.ts
-  test ! -e packages/playwright-core/src/ohos/ohos-aa.ts
-  grep -q "options.channel ?? 'chrome'" packages/playwright-core/src/ohos/launcher.ts
-
-  echo "==> installing build dependencies"
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PLAYWRIGHT_SKIP_BROWSER_GC=1 \
-    ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci --no-audit --no-fund
-
-  echo "==> swapping in $lightningcss_spec"
-  lightningcss_tarball=$(npm pack "$lightningcss_spec" --silent)
-  rm -rf node_modules/lightningcss
-  mkdir node_modules/lightningcss
-  tar -zxf "$lightningcss_tarball" -C node_modules/lightningcss --strip-components=1
-  rm "$lightningcss_tarball"
-  node -e '
-    const { transform } = require("lightningcss");
-    const out = transform({ filename: "a.css", code: Buffer.from(".a{color:red}"), minify: true });
-    console.log("lightningcss transform OK:", JSON.stringify(out.code.toString().trim()));
-  '
-
-  echo "==> regenerating the protocol channels"
-  node utils/generate_channels.js || [ $? -eq 1 ]
-
-  echo "==> building playwright-core"
-  npm_package_version="$version" node utils/build/build.js
-  node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
+function assertIncludes(file, marker) {
+  assert.ok(readFileSync(file, 'utf8').includes(marker), `${file}: missing ${marker}`);
 }
 
-package() {
-  cd "$build_dir/$source_dir"
-  echo "==> packaging $artifact_dir"
-  cd packages/playwright-core
-  npm pack --ignore-scripts >/dev/null
-  cd "$build_dir"
-  rm -rf "$artifact_dir"
-  mkdir -p "$artifact_dir"
-  tar -zxf "$source_dir/packages/playwright-core/playwright-core-$version.tgz" \
-    -C "$artifact_dir" --strip-components=1
-  rm "$source_dir/packages/playwright-core/playwright-core-$version.tgz"
+function assertNoElfFiles(directory) {
+  const elfFiles = filesBelow(directory).filter((file) => readFileSync(file).subarray(0, 4).toString('hex') === '7f454c46');
+  assert.deepEqual(elfFiles, [], `unexpected ELF files in artifact: ${elfFiles.join(' ')}`);
 }
 
-check() {
-  (
-    cd "$build_dir/$artifact_dir"
+function verifyArtifact() {
+  run(process.execPath, ['--check', join(artifactDir, 'index.js')]);
+  run(process.execPath, [join(rootDir, 'tests/aa-first.cjs'), join(artifactDir, 'lib/ohos/launcher.js')]);
+  run(process.execPath, [join(rootDir, 'tests/public-api.cjs'), artifactDir]);
+  assertIncludes(join(artifactDir, 'lib/ohos/index.js'), 'require("../../index.js")');
 
-    node --check index.js
-    node "$script_dir/tests/aa-first.cjs" "$PWD/lib/ohos/launcher.js"
-    node "$script_dir/tests/public-api.cjs" "$PWD"
-    grep -q 'require("../../index.js")' lib/ohos/index.js
-    node -e '
-      const pkg = require("./package.json");
-      if (pkg.name !== "@ohos-npm-ports/playwright-core") throw new Error(`unexpected name: ${pkg.name}`);
-      if (!pkg.exports["./lib/ohos"]) throw new Error("exports[./lib/ohos] missing");
-      console.log("verify OK:", pkg.name, pkg.version);
-    '
+  const pkg = readJson(join(artifactDir, 'package.json'));
+  assert.equal(pkg.version, version);
+  assert.ok(pkg.exports['./lib/ohos'], 'exports[./lib/ohos] missing');
+  assertNoElfFiles(artifactDir);
 
-    elf_files=$(find . -type f -exec sh -c 'od -An -tx1 -N4 "$1" | grep -q "7f 45 4c 46"' _ {} \; -print)
-    [ -z "$elf_files" ] || {
-      echo "unexpected ELF files in artifact:" $elf_files >&2
-      exit 1
+  const artifactRequire = createRequire(join(artifactDir, 'package.json'));
+  const playwright = artifactRequire('./index.js');
+  for (const name of ['chromium', 'firefox', 'webkit']) {
+    assert.equal(typeof playwright[name]?.launch, 'function', `playwright-core.${name}.launch missing`);
+  }
+  const ohos = artifactRequire('./lib/ohos');
+  for (const name of ['launchViaAa', 'takeScreenshot', 'resolveLaunchConfig']) {
+    assert.ok(name in ohos, `lib/ohos export missing: ${name}`);
+  }
+  assert.equal(typeof ohos.chromium?.launch, 'function', 'lib/ohos re-export of playwright-core is broken');
+
+  assertIncludes(join(artifactDir, 'lib/coreBundle.js'), 'ohosExecutablePath');
+  assertIncludes(join(artifactDir, 'lib/coreBundle.js'), 'startBrowserViaAa');
+  assertIncludes(join(artifactDir, 'lib/coreBundle.js'), '__ohosDeviceBrowser');
+  if (process.platform === 'openharmony') {
+    const path = process.env.PATH;
+    try {
+      process.env.PATH = '';
+      assert.equal(playwright.chromium.executablePath(), 'aa');
+    } finally {
+      if (path === undefined) delete process.env.PATH;
+      else process.env.PATH = path;
+    }
+  }
+
+  const browser = process.env.HARMONY_BROWSER;
+  try {
+    delete process.env.HARMONY_BROWSER;
+    assert.equal(ohos.resolveLaunchConfig({}).bundleName, 'com.haitai.htbrowser');
+    process.env.HARMONY_BROWSER = 'huaweiBrowser';
+    assert.equal(ohos.resolveLaunchConfig({}).bundleName, 'com.huawei.hmos.browser');
+  } finally {
+    if (browser === undefined) delete process.env.HARMONY_BROWSER;
+    else process.env.HARMONY_BROWSER = browser;
+  }
+
+  assert.ok(!existsSync(join(artifactDir, 'lib/ohos/hdc.js')));
+  assert.ok(!existsSync(join(artifactDir, 'lib/ohos/ohos-aa.js')));
+  const removedBackend = /HdcBackend|launchViaHdc|hdcScreenshot|hdcEnvironment|findHarmonybrewHdc/;
+  for (const file of [...filesBelow(join(artifactDir, 'lib/ohos')), join(artifactDir, 'lib/coreBundle.js')]) {
+    assert.ok(!removedBackend.test(readFileSync(file, 'utf8')), `removed backend remains in ${file}`);
+  }
+}
+
+export default class PlaywrightCore extends Port {
+  static pkgname = 'playwright-core';
+  static upstream = 'playwright-core';
+  static version = version;
+  static revision = 3;
+  static distTag = 'latest';
+  static packages = [`build/playwright-core-${version}`];
+  static source = `https://codeload.github.com/microsoft/playwright/tar.gz/refs/tags/v${version}`;
+  static sha256 = '4cf21457cd00395c83b29e7f787b72e8b3bb00cee14728c69ac80a12ae42f089';
+
+  prepare() {
+    mkdirSync(buildDir, { recursive: true });
+    cd(buildDir);
+    console.log(`==> downloading playwright ${version} source`);
+    fetchSource(`${sourceDir}.tar.gz`);
+    rmSync(sourceDir, { recursive: true, force: true });
+    run('tar', ['-zxf', `${sourceDir}.tar.gz`]);
+    rmSync(`${sourceDir}.tar.gz`);
+    cd(sourceDir);
+  }
+
+  build() {
+    cd(sourceDir);
+    console.log('==> applying patches');
+    for (const patch of readdirSync(join(rootDir, 'patches')).filter((file) => file.endsWith('.patch')).sort()) {
+      console.log(`patch -p1 < ${patch}`);
+      run('patch', ['-p1'], { input: readFileSync(join(rootDir, 'patches', patch)) });
     }
 
-    node -e '
-      const pw = require("./index.js");
-      for (const name of ["chromium", "firefox", "webkit"]) {
-        if (typeof pw[name]?.launch !== "function") throw new Error(`playwright-core.${name}.launch missing`);
-      }
-      console.log("index.js smoke OK: chromium/firefox/webkit present");
-    '
-    node -e '
-      const ohos = require("./lib/ohos");
-      for (const name of ["launchViaAa", "takeScreenshot", "resolveLaunchConfig"]) {
-        if (!(name in ohos)) throw new Error(`lib/ohos export missing: ${name}`);
-      }
-      // A leftover bare require("playwright-core") would throw here in a
-      // direct (non-aliased) @ohos-npm-ports install, since there is no
-      // node_modules/playwright-core in that layout.
-      if (typeof ohos.chromium?.launch !== "function") throw new Error("lib/ohos re-export of playwright-core is broken");
-      console.log("lib/ohos smoke OK: launchViaAa/takeScreenshot present, playwright-core re-export resolves");
-    '
+    console.log('==> verifying patch markers');
+    const src = join(sourceDir, 'packages/playwright-core/src');
+    assert.ok(existsSync(join(src, 'ohos/launcher.ts')));
+    assertIncludes(join(sourceDir, 'packages/protocol/spec/mixins.yml'), 'harmonyBundleName');
+    assertIncludes(join(src, 'server/registry/index.ts'), "isOpenHarmony() ? resolveCommandPath('ffmpeg')");
+    assertIncludes(join(src, 'server/chromium/chromium.ts'), 'ohosExecutablePath');
+    assertIncludes(join(src, 'ohos/launcher.ts'), 'browserProcess.onclose');
+    assertIncludes(join(src, 'ohos/launcher.ts'), 'launchViaAa');
+    assert.ok(!existsSync(join(src, 'ohos/hdc.ts')));
+    assert.ok(!existsSync(join(src, 'ohos/ohos-aa.ts')));
+    assertIncludes(join(src, 'ohos/launcher.ts'), "options.channel ?? 'chrome'");
 
-    grep -q 'ohosExecutablePath' lib/coreBundle.js
-    grep -q 'startBrowserViaAa' lib/coreBundle.js
-    grep -q '__ohosDeviceBrowser' lib/coreBundle.js
-    node -e '
-      if (process.platform !== "openharmony") process.exit(0);
-      process.env.PATH = "";
-      const { chromium } = require("./index.js");
-      if (chromium.executablePath() !== "aa") throw new Error("executablePath must resolve local aa");
-      console.log("local aa executablePath smoke OK");
-    '
-    node -e '
-      const ohos = require("./lib/ohos");
-      delete process.env.HARMONY_BROWSER;
-      const def = ohos.resolveLaunchConfig({});
-      if (def.bundleName !== "com.haitai.htbrowser") throw new Error(`default browser = ${def.bundleName}`);
-      process.env.HARMONY_BROWSER = "huaweiBrowser";
-      const huawei = ohos.resolveLaunchConfig({});
-      if (huawei.bundleName !== "com.huawei.hmos.browser") throw new Error(`HARMONY_BROWSER override = ${huawei.bundleName}`);
-      console.log("default browser smoke OK:", def.bundleName);
-    '
-    test ! -e lib/ohos/hdc.js
-    test ! -e lib/ohos/ohos-aa.js
-    if grep -RE 'HdcBackend|launchViaHdc|hdcScreenshot|hdcEnvironment|findHarmonybrewHdc' lib/ohos lib/coreBundle.js; then
-      echo "removed backend remains in the artifact" >&2
-      exit 1
-    fi
-  )
+    console.log('==> installing build dependencies');
+    run('npm', ['ci', '--no-audit', '--no-fund'], {
+      env: {
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
+        PLAYWRIGHT_SKIP_BROWSER_GC: '1',
+        ELECTRON_SKIP_BINARY_DOWNLOAD: '1',
+      },
+    });
 
-  echo "==> done: $build_dir/$artifact_dir"
+    console.log(`==> swapping in ${lightningcssSpec}`);
+    const lightningcssTarball = run('npm', ['pack', lightningcssSpec, '--silent'], { capture: true }).stdout.trim();
+    rmSync(join(sourceDir, 'node_modules/lightningcss'), { recursive: true, force: true });
+    mkdirSync(join(sourceDir, 'node_modules/lightningcss'));
+    run('tar', ['-zxf', lightningcssTarball, '-C', join(sourceDir, 'node_modules/lightningcss'), '--strip-components=1']);
+    rmSync(lightningcssTarball);
+    const sourceRequire = createRequire(join(sourceDir, 'package.json'));
+    const { transform } = sourceRequire('lightningcss');
+    const output = transform({ filename: 'a.css', code: Buffer.from('.a{color:red}'), minify: true });
+    console.log('lightningcss transform OK:', JSON.stringify(output.code.toString().trim()));
+
+    console.log('==> regenerating the protocol channels');
+    run(process.execPath, ['utils/generate_channels.js'], { allowExitCodes: [0, 1] });
+    console.log('==> building playwright-core');
+    run(process.execPath, ['utils/build/build.js'], { env: { npm_package_version: version } });
+    run(process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.json', '--noEmit']);
+  }
+
+  package() {
+    cd(join(sourceDir, 'packages/playwright-core'));
+    console.log(`==> packaging playwright-core-${version}`);
+    run('npm', ['pack', '--ignore-scripts']);
+    rmSync(artifactDir, { recursive: true, force: true });
+    mkdirSync(artifactDir, { recursive: true });
+    const tarball = join(sourceDir, `packages/playwright-core/playwright-core-${version}.tgz`);
+    run('tar', ['-zxf', tarball, '-C', artifactDir, '--strip-components=1']);
+    rmSync(tarball);
+    verifyArtifact();
+    console.log(`==> done: ${artifactDir}`);
+  }
+
+  async test() {
+    const context = recipeContext();
+    const playwright = requirePackage('playwright-core');
+    const manifest = requirePackage('playwright-core/package.json');
+    const root = dirname(context.resolvePackage('playwright-core/package.json'));
+    for (const name of ['chromium', 'firefox', 'webkit']) {
+      assert.equal(playwright[name].name(), name);
+      assert.equal(typeof playwright[name].launch, 'function');
+    }
+    assert.ok(playwright.devices['Desktop Chrome'].viewport.width > 0);
+    const cli = run(process.execPath, [join(root, 'cli.js'), '--version'], { capture: true, timeout: 30000 }).stdout.trim();
+    assert.match(cli, /^Version 1\.64\.1(?:-\d+)?$/);
+    const executable = playwright.chromium.executablePath();
+    if (process.platform === 'openharmony') assert.ok(executable === 'aa' || executable.endsWith('/aa'));
+    else assert.ok(executable && executable !== 'aa' && !executable.endsWith('/aa'));
+
+    if (context.mode === 'overrides') {
+      assert.equal(manifest.name, '@ohos-npm-ports/playwright-core');
+      const ohos = requirePackage('playwright-core/lib/ohos');
+      assert.equal(typeof ohos.launchViaAa, 'function');
+      const helpers = Object.keys(ohos).filter((name) => name !== 'default' && !(name in playwright)).sort();
+      assert.deepEqual(helpers, [
+        'ARK_WEB_BUNDLE_NAME', 'httpGetJson', 'launchViaAa', 'ohosInitScript',
+        'resolveLaunchConfig', 'takeScreenshot', 'waitForEndpoint',
+      ].sort());
+      const image = Buffer.from('cdp-image');
+      assert.equal(await ohos.takeScreenshot({ screenshot: async () => image }), image);
+      const failure = Error('CDP failure');
+      await assert.rejects(ohos.takeScreenshot({ screenshot: async () => { throw failure; } }), (error) => error === failure);
+    }
+
+    const server = createServer(async (req, res) => {
+      try {
+        const parts = [];
+        for await (const part of req) parts.push(part);
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Set-Cookie', 'consumer=playwright; Path=/; HttpOnly');
+        res.end(JSON.stringify({
+          method: req.method,
+          url: req.url,
+          cookie: req.headers.cookie || '',
+          data: parts.length ? JSON.parse(Buffer.concat(parts).toString()) : null,
+        }));
+      } catch (error) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: error.message }));
+      }
+    });
+    let requestContext;
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      requestContext = await playwright.request.newContext({ baseURL: `http://127.0.0.1:${server.address().port}` });
+      const get = await requestContext.get('/probe?q=hello');
+      assert.equal(get.status(), 200);
+      assert.deepEqual(await get.json(), { method: 'GET', url: '/probe?q=hello', cookie: '', data: null });
+      const data = { message: '鸿蒙 consumer', answer: 42 };
+      const post = await requestContext.post('/echo', { data });
+      assert.equal(post.status(), 200);
+      assert.deepEqual(await post.json(), { method: 'POST', url: '/echo', cookie: 'consumer=playwright', data });
+      const storage = await requestContext.storageState();
+      assert.ok(storage.cookies.some((cookie) => cookie.name === 'consumer' && cookie.value === 'playwright'));
+      return {
+        result: {
+          browsers: ['chromium', 'firefox', 'webkit'],
+          cliVersion: '1.64.1',
+          apiRequest: { get: true, jsonPost: true, cookies: true, storageState: true },
+        },
+        assets: [],
+      };
+    } finally {
+      try {
+        await requestContext?.dispose();
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    }
+  }
 }

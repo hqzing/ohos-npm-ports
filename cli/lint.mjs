@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resourceDeclarations } from './bump.mjs';
+import { splitRecipe } from './recipe-source.mjs';
 
 function lintPatch(file, text, port) {
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -50,7 +51,7 @@ function lintPatch(file, text, port) {
 function lintImplementation(directory, source, file, port) {
   const patches = join(directory, 'patches');
   if (!existsSync(patches)) return;
-  const appliesAll = /patches\/\*\.patch|patches\/\*[^.]/.test(source);
+  const appliesAll = /patches\/\*\.patch|patches\/\*[^.]|readdirSync\([^)]*['"]patches['"]\)/.test(source);
   for (const entry of readdirSync(patches)) {
     if (!entry.endsWith('.patch')) continue;
     const patch = join(patches, entry);
@@ -60,33 +61,46 @@ function lintImplementation(directory, source, file, port) {
 }
 
 function lintDeclarations(source, file) {
+  if (!source.startsWith('#!/usr/bin/env node\n')) throw new Error(`${file}: expected #!/usr/bin/env node`);
+  if (!/export default class\s+[A-Za-z0-9_]+\s+extends\s+Port\s*\{/.test(source)) {
+    throw new Error(`${file}: expected a default-exported class extending Port`);
+  }
   const declarations = new Map();
   for (const line of source.split('\n')) {
-    if (/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/.test(line)) break;
-    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/.exec(line);
+    const match = /^(?:const\s+([A-Za-z_$][\w$]*)|  static\s+([A-Za-z_$][\w$]*))\s*=/.exec(line);
     if (!match) continue;
-    if (declarations.has(match[1])) throw new Error(`${file}: duplicate global assignment ${match[1]}`);
-    declarations.set(match[1], true);
+    const name = match[1] ?? `static ${match[2]}`;
+    if (declarations.has(name)) throw new Error(`${file}: duplicate declaration ${name}`);
+    declarations.set(name, true);
   }
-  const alias = /^\s*(?:export\s+)?(version|pkgname)=["']?\$\{?\1\}?["']?\s*$/m.exec(source);
-  if (alias) throw new Error(`${file}: metadata alias ${alias[1]} is redundant; reference it directly`);
-  if (/^\s*(?:export\s+)?(?:VERSION|UPSTREAM_VERSION|PKG_VERSION)=["']?\d/m.test(source)) {
-    throw new Error(`${file}: version literals must reference the version metadata`);
-  }
-  const legacyAlias = /^\s*(?:export\s+)?(VERSION|UPSTREAM_VERSION|PKG_VERSION|PKG_NAME|PKG|PORTS_VERSION|PORT_VERSION|SLOT_VERSION)=/m.exec(source);
-  if (legacyAlias) throw new Error(`${file}: legacy metadata alias ${legacyAlias[1]}; use lower_snake_case or the global metadata directly`);
+  if (!/^const version = '[^']+';$/m.test(source)) throw new Error(`${file}: version must use a top-level literal const`);
+  if (!/^  static version = version;$/m.test(source)) throw new Error(`${file}: static version must reference the shared const`);
+  if (!/^  static revision = \d+;$/m.test(source)) throw new Error(`${file}: static revision must be a numeric literal`);
   const hashes = source.match(/\b[0-9a-f]{64}\b/g) ?? [];
   if (new Set(hashes).size !== hashes.length) throw new Error(`${file}: duplicate SHA-256 literal; declare it once and reference it`);
 }
 
+function lintTestLayout(source, file) {
+  if (/^  (?:async\s+)?check\s*\(/m.test(source)) throw new Error(`${file}: check() is obsolete; use package assertions and test()`);
+  const { testText } = splitRecipe(source);
+  if (!testText) return;
+  if (!/(?:async\s+)?test\s*\([^)]*\)\s*\{[\s\S]*\}\s*$/.test(testText)) {
+    throw new Error(`${file}: test() must be the last class method`);
+  }
+  if (/^  (?:async\s+)?(?:prepare|build|package|slot_[A-Za-z0-9_]+_(?:prepare|build|package))\s*\([^)]*\)\s*\{\s*$/m.test(testText)) {
+    throw new Error(`${file}: build hooks must not appear after the test section`);
+  }
+}
+
 export function lintPort(port) {
   const file = join(port.dir, 'NPMBUILD');
-  execFileSync('bash', ['-n', file], { stdio: ['ignore', 'pipe', 'inherit'] });
+  execFileSync(process.execPath, ['--check', file], { stdio: ['ignore', 'pipe', 'inherit'] });
   const source = readFileSync(file, 'utf8');
   lintDeclarations(source, file);
+  lintTestLayout(source, file);
   const declarations = resourceDeclarations(source);
-  const firstHook = source.search(/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/m);
-  if (firstHook !== -1 && /^resource\s/m.test(source.slice(firstHook))) {
+  const firstHook = /^  (?:async\s+)?(?:prepare|build|package)\s*\(/m.exec(source);
+  if (firstHook && /\bresource\s*\(/.test(source.slice(firstHook.index))) {
     throw new Error(`${file}: resource declarations must precede lifecycle hooks`);
   }
   for (const declaration of declarations) {
@@ -94,23 +108,11 @@ export function lintPort(port) {
       throw new Error(`${file}: resource ${declaration.name} must reference \${version} instead of repeating ${port.version}`);
     }
   }
-  for (const line of source.split('\n')) {
-    if (/^\s*(?:\$\{?curl\}?|curl)\s/.test(line) && !/(?:-fsIL|\s-I(?:\s|$)|--head)/.test(line)) {
-      throw new Error(`${file}: use fetch_source or fetch_resource for downloads`);
-    }
-  }
-  if (/\bNPMBUILD_(?:REVISION|PORT_VERSION)\b/.test(source) || /\$\{?version\}?-\d+/.test(source)) {
-    throw new Error(`${file}: use bare upstream version; revision is injected by npm-ports normalize`);
-  }
-  if (/\breadelf\b/.test(source)) {
-    throw new Error(`${file}: readelf checks are not needed in NPMBUILD`);
-  }
+  if (/\breadelf\b/.test(source)) throw new Error(`${file}: readelf checks are not needed in NPMBUILD`);
   if (/binary-sign-tool|sign -selfSign|\.codesign|ohos-selfsign/.test(source)) {
     throw new Error(`${file}: ELF signing and signature checks are managed by npm-ports pack`);
   }
-  if (/\n[ \t]*\n[ \t]*\n/.test(source)) {
-    throw new Error(`${file}: collapse consecutive blank lines`);
-  }
+  if (/\n[ \t]*\n[ \t]*\n/.test(source)) throw new Error(`${file}: collapse consecutive blank lines`);
   if (source.split('\n').some((line) => !line.trimStart().startsWith('#') && line.includes('npm publish'))) {
     throw new Error(`${file}: publishing is managed by npm-ports, not NPMBUILD`);
   }

@@ -1,58 +1,62 @@
 # 验证标准
 
-“构建成功”不等于“包能用”。原生 addon 可能编译和签名都正确，却因 loader 分支错误而在真实 require() 时崩溃。验证至少分为构建期自证、发布安装和 consumer 功能三层。
+“构建成功”不等于“包能用”。验证分为构建与产物断言、发布安装和安装后功能测试三层。
 
-## 1. 构建期自验证
+## 1. 构建与产物断言
 
-NPMBUILD 的 `check()` 应证明 `package()` 生成的产物正确，而不是只生成文件。`npm-ports check` 会自动执行 `prepare()`、`build()`、`package()`、发布清单规范化和 `check()`，无需在钩子内手动串联：
+构建生命周期为 `prepare() → build() → package() → normalize`，不再有 `check()` 钩子：
 
-1. **包名和版本断言**：检查 package.json 的 name 和最终发布版本。名称、`<上游版本>-<revision>` 和同 port 槽位引用由框架在 `check()` 前统一注入，不需要补丁修改。上游版本使用 `${version}`，最终发布版本从实际 package.json 读取，不要自行拼接 revision。
-2. **真实加载**：用 `node -e "require('./index.js')"` 或等价方式实际加载。`node --check` 只能检查语法。有条件时再调用真实功能，例如 parcel-watcher 的 writeSnapshot。
-3. **loader 分支命中**：如果补丁增加 openharmony 分支，验证标记确实进入产物，而不是只看 patch 命令退出码。
+- `prepare()` / `build()`：验证源码 hash、patch marker、编译结果和源码树约束。
+- `package()`：验证发布目录、原生文件、生成布局和不依赖 normalize 的 manifest 内容。
+- normalize：统一写入并验证包名、最终发布版本、repository 和同 port 槽位引用。
+- pack：统一为 AArch64  ELF 签名；签名失败会中断打包。配方不需要调用签名工具或 `readelf`。
 
-签名及 `readelf` 检查不属于 NPMBUILD 的贡献者工作。`npm-ports pack` 统一保障 AArch64 ELF 签名，签名工具失败会中断打包。
-
-这些验证属于配方质量要求。`npm-ports lint` 只能检查结构，不能替代它们。
+这些断言属于构建步骤本身，不是另一个测试块。只有安装后功能验证才写入 `test()`。
 
 ## 2. 本地提交前验证
 
-在 ci-runner 容器中按以下顺序检查单个 port：
+在 ci-runner 容器中按顺序执行：
 
 ```sh
 npm-ports lint <port>
-npm-ports check <port>
+npm-ports pack <port>
 npm-ports validate-publish <port>
+npm-ports test <port>
 ```
 
-- `npm-ports lint` 检查配方结构和静态约束。
-- `npm-ports check` 执行完整生命周期并运行配方的 `check()`。
-- `npm-ports validate-publish` 打包全部产物、发布到临时 Verdaccio、校验 tarball 和 integrity，并在干净目录实际安装。
+- `lint`：检查 ESM、class、元数据、patch 和静态约束。
+- `pack`：执行完整构建、normalize、签名并生成 tarball。
+- `validate-publish`：发布到临时 Verdaccio，校验 tarball 和 integrity，并在干净目录安装全部主包和槽位。
+- `test`：使用同一临时 registry 与 consumer 执行器调用配方的 `test()`。没有 `test()` 的 port 仍需完成前三项和通用安装验证。
 
-需要跨平台验证时，同时保留或更新 port 的 `test.js`。日常发布检查使用 `npm-ports publish --dry-run` 或临时 Verdaccio，不发布到 npm 中心仓。
+`check` 目前只是 `test` 的兼容别名，新流程不要继续依赖它。日常发布检查使用临时 registry，不发布到 npm 中心仓。
 
-## 3. CI 验证边界
+## 3. CI 发布前私仓校验
 
-构建发生在 ci-runner 容器中。容器通过不代表可直接部署到真机，不覆盖：
+CI 先执行 `npm-ports package` 完成构建与 normalize，再执行 `npm-ports validate-publish`：
+
+- dry-run 与真实本地发布的包清单一致。
+- 主包和槽位按 packages 顺序发布。
+- registry 下载的 tarball 来自本临时私仓，SHA-512 与 integrity 一致。
+- 在干净目录执行包含 install 脚本的 npm install。
+- 通过验证的同一 tarball 和 manifest 上传为 artifact，保留 7 天，不另做 bottle。
+
+这一步在 PR 和 push 上都执行，不发布到中心仓，也不能代替功能测试。
+
+## 4. 多平台 consumer 与唯一 `test()`
+
+全部 port 默认进入五平台通用安装矩阵，不需要 `test()`。runner 下载本轮构建或已发布 artifact，在各平台的临时 Verdaccio 中安装主包，按 os/cpu 检查槽位、所有应安装的包、版本和 bin，再执行 npm ci。
+
+`test()` 只承担额外的真实 API、CLI、加载和工程行为验证。普通 OS 比较 baseline 和 overrides 的结构化报告，OpenHarmony 验证 overrides。测试返回 `{ result, assets? }`，不再使用独立 `test.js` 或写报告环境变量。
+
+本地 `npm-ports test` 与 CI 使用同一执行器。测试声明写在 class 末尾，setup 使用 `testSetup()`。通用安装通过不等于功能正确，因此原生加载和关键业务行为应在唯一 `test()` 中覆盖，而不是另建检查入口。
+
+## 5. 验证边界
+
+容器构建和跨平台 consumer 不等同于真机部署证明，不覆盖：
 
 - 商用 HarmonyOS 设备的沙箱行为差异。
 - 真机代码签名校验细节。
 - 真实业务负载下的性能和稳定性。
 
-发布前应根据目标设备补做真机验证。
-
-## 4. CI 发布前私仓校验
-
-每个配方构建后，CI 对 NPMBUILD 声明的全部产物执行 `npm-ports pack --no-build`，再发布到临时 Verdaccio：
-
-- dry-run 与真实本地发布的包清单必须一致。
-- 主包和槽位包按 packages 顺序发布。
-- registry 下载的 tarball 必须来自本临时私仓，SHA-512 与 integrity 一致。
-- 在干净目录执行包含 install 脚本的 npm install。
-
-这一步在 PR 和 push 上都执行，不发布到 npm 中心仓。通过后，同一 tarball 和 manifest 上传为 `port-<port>` artifact，保留 7 天。它只证明“包能发布并安装”，不能代替功能测试。
-
-## 5. 多平台 consumer
-
-全部 port 默认进入五平台通用安装矩阵，不需要 `test.js`。runner 根据构建矩阵选择 port，校验 artifact integrity 后通过临时 Verdaccio 安装主包，按 os/cpu 过滤检查槽位、实际安装版本和 bin，再执行 npm ci。全量 dispatch 覆盖全部 port，普通变更覆盖受影响 port。只改 CI 或 consumer 脚本时只测 `sentinel-ports.json` 里的哨兵 port，全量验证用手动 dispatch；改 consumer 脚本时哨兵不重建，测试的是 npm 上已发布的包。没有功能测试文件不会跳过安装验证。
-
-`test.js` 用于补充真实 API、CLI、加载和工程行为。已配置的 primary port 继续在 Windows x64、Linux x64/arm64、macOS arm64 和 OpenHarmony arm64 上运行。普通 OS 比较 baseline 与 overrides，OpenHarmony 验证 overrides。槽位使用同配方 artifact，不另开独立 port job。通用安装通过不等于功能正确，原生加载和关键业务行为仍应在 port 的 `check()` 或 `test.js` 中验证。
+发布前应根据目标设备补做真机验证。真机 harness 可以保留在 port 的 `tests/device/` 等目录，不必塞入 NPMBUILD。

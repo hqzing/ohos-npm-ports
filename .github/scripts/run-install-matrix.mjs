@@ -9,6 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { artifactsForPort, registryConfig } from './consumer-registry.mjs';
 import { loadPort } from '../../cli/port.mjs';
+import { buildInputsEqual } from './recipe-inputs.mjs';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const versions = JSON.parse(readFileSync(join(repo, '.github/scripts/tool-versions.json'), 'utf8'));
@@ -59,9 +60,7 @@ function manifests(directory, selected) {
       const args = ['-c', `safe.directory=${repo}`];
       try { execFileSync('git', [...args, 'cat-file', '-e', `${manifest.sourceSha}^{commit}`], { cwd: repo, stdio: 'ignore' }); }
       catch { execFileSync('git', [...args, 'fetch', '--no-tags', 'origin', manifest.sourceSha], { cwd: repo, stdio: 'inherit' }); }
-      const inputs = (ref) => execFileSync('git', [...args, 'ls-tree', '-r', ref, '--', manifest.portDir], { cwd: repo, encoding: 'utf8' })
-        .split('\n').filter((line) => line && !line.endsWith('/test.js')).join('\n');
-      assert.equal(inputs('HEAD'), inputs(manifest.sourceSha), `Replayed build inputs changed: ${manifest.portDir}`);
+      assert.ok(buildInputsEqual(manifest.sourceSha, 'HEAD', manifest.portDir), `Replayed build inputs changed: ${manifest.portDir}`);
     } else {
       assert.equal(manifest.sourceSha, process.env.GITHUB_SHA, `Artifact from a different commit: ${path}`);
     }

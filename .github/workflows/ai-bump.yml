@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26.13.0'
       - name: Validate the automated bump PR
         env:
           GH_TOKEN: ${{ github.token }}

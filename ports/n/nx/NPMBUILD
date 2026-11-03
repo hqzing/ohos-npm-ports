@@ -1,295 +1,280 @@
-#!/usr/bin/env bash
-pkgname="nx"
-upstream="nx"
-version="24.0.3"
-revision=1
-source="https://registry.npmjs.org/${pkgname}/-/${pkgname}-${version}.tgz"
-sha256="7b28f6421f8547ebf1437655e903e25ac781e961e7068e40c3d0f6dcb76a0e1f"
-dist_tag="latest"
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import { constants, accessSync, chmodSync, cpSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join, relative, sep } from 'node:path';
+import { Port, resource, run, fetchSource, fetchResource, writeJson, requirePackage, recipeContext } from '../../../cli/recipe.mjs';
 
-packages=(
-  "nx-${version}"
-)
-vt100_rev=b15dc3b0f7db94167a9c584f1d403899c0cc871d
-wezterm_rev=b538ee29e1e89eeb4832fb35ae095564dce34c29
-resource "vt100" \
-  "https://codeload.github.com/JamesHenry/vt100-rust/tar.gz/${vt100_rev}" \
-  "644bb51e1072711e8e44da70dbfa69e0bcfd1579a289ea3b9758e4ca26113fc1"
-resource "wezterm" \
-  "https://codeload.github.com/cammisuli/wezterm/tar.gz/${wezterm_rev}" \
-  "d722cb3cd4eea2d5309c6a39a09768cc57099f42aef21f5e527e28eafbd9b542"
+const version = '24.0.3';
+const vt100Rev = 'b15dc3b0f7db94167a9c584f1d403899c0cc871d';
+const weztermRev = 'b538ee29e1e89eeb4832fb35ae095564dce34c29';
+const rootDir = import.meta.dirname;
+const sourceDir = join(rootDir, 'src');
+const packageDir = join(rootDir, `nx-${version}`);
+const jsbuildDir = join(rootDir, '_jsbuild');
+const carryDir = join(rootDir, 'carry');
+const npmInstallPackages = [
+  '../nx.tgz',
+  'typescript@6.0.3',
+  '@types/node@24.13.3',
+  '@angular-devkit/core@22.1.4',
+  '@angular-devkit/architect@0.2201.4',
+  '@angular-devkit/schematics@22.1.4',
+  'rxjs@7.8.2',
+  'prettier@3.6.2',
+  'ts-node@10.9.1',
+  '@pnpm/lockfile-types@6.0.0',
+  '@nx/key@5.0.4',
+  '@nx/powerpack-license@5.0.4',
+  '@swc-node/register@1.11.1',
+  '@swc/core@1.15.10',
+  'ora@5.4.1',
+  'chalk@4.1.2',
+  'cli-cursor@3.1.0',
+  'cli-spinners@2.6.1',
+  'log-symbols@4.1.0',
+  'string-width@4.2.3',
+  'strip-ansi@6.0.1',
+  'ansi-regex@5.0.1',
+  'is-interactive@1.0.0',
+  'is-unicode-supported@0.1.0',
+  'onetime@5.1.2',
+  'restore-cursor@3.1.0',
+  'signal-exit@3.0.7',
+];
 
-build() {
-  # nx OpenHarmony port. Both halves are built from source: the native binding
-  # with `cargo build --release` (this container's rustc host triple is already
-  # aarch64-unknown-linux-ohos), and the CLI JavaScript with plain `tsc` against
-  # the package's own tsconfig.lib.json.
-  #
-  # Upstream's own `nx build nx` is not reproducible here: it pulls the whole
-  # pnpm monorepo toolchain (~294 root devDependencies, a webpack build of the
-  # graph-client web app, a rustup-nightly WASI build, and tsgo, which has no
-  # openharmony build). Two file groups are therefore carried over from the
-  # upstream npm tarball; the parity check below proves everything else in
-  # dist/ is our own tsc output or copied from the git checkout.
-
-  # Sparse, blob-filtered clone: the full monorepo checkout is huge. Cone mode
-  # always includes root files, so Cargo.toml/Cargo.lock/tsconfig.base.json
-  # come along with packages/nx.
-  git clone --depth 1 --filter=blob:none --sparse --branch "${version}" https://github.com/nrwl/nx src
-  cd src
-  git sparse-checkout set packages/nx
-  cd ..
-
-  # Vendor the two cargo git dependencies as tarballs so cargo never has to
-  # speak the git protocol; 0001 re-points them via [patch] sections.
-  mkdir -p gitdeps/wezterm
-
-  fetch_resource "vt100" "vt100.tar.gz"
-  tar -zxf vt100.tar.gz
-  mv "vt100-rust-${vt100_rev}" gitdeps/vt100-rust
-  rm vt100.tar.gz
-
-  # Only the pty/ and filedescriptor/ crates of the wezterm monorepo are used.
-  fetch_resource "wezterm" "wezterm.tar.gz"
-  tar -zxf wezterm.tar.gz "wezterm-${wezterm_rev}/pty" "wezterm-${wezterm_rev}/filedescriptor"
-  mv "wezterm-${wezterm_rev}/pty" "wezterm-${wezterm_rev}/filedescriptor" gitdeps/wezterm/
-  rm -rf "wezterm-${wezterm_rev}" wezterm.tar.gz
-
-  # 0002: bump portable-pty's nix 0.25 -> 0.30 (nix >= 0.30 has target_env =
-  # "ohos" gates; 0.25 predates them and its default features don't compile
-  # there) + one tcgetattr call-site fix for the nix 0.26+ AsFd API.
-  cd gitdeps/wezterm
-  patch -p1 <../../patches/0002-portable-pty-nix-bump.patch
-  cd ../..
-
-  # --- apply source patches ---
-
-  cd src
-  # 0001: exclude jemalloc on target_env = "ohos" (tikv-jemalloc-sys fails to
-  # build there) + the [patch] sections for ../gitdeps, with Cargo.lock updates.
-  patch -p1 <../patches/0001-nx-source-ohos.patch
-  # 0003: whitelist openharmony; the `as string` cast is needed because
-  # @types/node's Platform union has no 'openharmony' member (TS2367).
-  patch -p1 <../patches/0003-assert-supported-platform.patch
-  # 0004: @ts-expect-error -> @ts-ignore — upstream compiles with tsgo, under
-  # which the directive is used; plain tsc rejects it as unused (TS2578).
-  # @ts-ignore is unused-safe under both and doesn't change the emitted JS.
-  patch -p1 <../patches/0004-tsc-expect-error-compat.patch
-  cd ..
-
-  # --- build the native binding ---
-
-  cd src
-  cargo build --release
-
-  test -f target/release/libnx.so
-  cp target/release/libnx.so nx.openharmony-arm64.node
-  llvm-strip --strip-all nx.openharmony-arm64.node
-  chmod +x nx.openharmony-arm64.node
-  cd ..
-
-  # --- fetch the upstream npm tarball (metadata + carry-over assets + deps) ---
-
-  fetch_source "nx.tgz"
-  tar -zxf nx.tgz
-  mv package "${pkgname}-${version}"
-  # Pristine file list of the published dist, for the parity check below.
-  cd "${pkgname}-${version}"
-  find dist -type f | sort >../published-dist.list
-  cd ..
-
-  # --- compile the CLI JavaScript from source ---
-
-  mkdir _jsbuild
-  printf '%s\n' '{"name":"nx-jsbuild","private":true}' >_jsbuild/package.json
-  cp src/tsconfig.base.json _jsbuild/
-  mkdir -p _jsbuild/packages
-  cp -r src/packages/nx _jsbuild/packages/
-  rm -rf _jsbuild/packages/nx/dist
-
-  cd _jsbuild
-  # nx's runtime deps (installed via the upstream tarball) provide most of the
-  # types tsc needs; the middle block adds the optional peer/type-only imports
-  # (@angular-devkit/*, rxjs, prettier, ts-node, @pnpm/lockfile-types, @nx/key,
-  # @nx/powerpack-license, @swc-node/register) and the compiler, pinned to the
-  # versions upstream's pnpm-lock.yaml uses.
-  #
-  # The last block is ALSO nx runtime deps, pinned explicitly because
-  # @angular-devkit/schematics depends on newer majors of them — without a
-  # top-level pin npm may hoist the newer major and tsc resolves the wrong
-  # types (e.g. ora 9's types are not callable, breaking the compile).
-  npm install --ignore-scripts \
-    ../nx.tgz \
-    typescript@6.0.3 \
-    @types/node@24.13.3 \
-    @angular-devkit/core@22.1.4 \
-    @angular-devkit/architect@0.2201.4 \
-    @angular-devkit/schematics@22.1.4 \
-    rxjs@7.8.2 \
-    prettier@3.6.2 \
-    ts-node@10.9.1 \
-    @pnpm/lockfile-types@6.0.0 \
-    @nx/key@5.0.4 \
-    @nx/powerpack-license@5.0.4 \
-    @swc-node/register@1.11.1 \
-    @swc/core@1.15.10 \
-    ora@5.4.1 \
-    chalk@4.1.2 \
-    cli-cursor@3.1.0 \
-    cli-spinners@2.6.1 \
-    log-symbols@4.1.0 \
-    string-width@4.2.3 \
-    strip-ansi@6.0.1 \
-    ansi-regex@5.0.1 \
-    is-interactive@1.0.0 \
-    is-unicode-supported@0.1.0 \
-    onetime@5.1.2 \
-    restore-cursor@3.1.0 \
-    signal-exit@3.0.7
-
-  node ./node_modules/typescript/bin/tsc -p packages/nx/tsconfig.lib.json
-  cd ..
-
-  # --- assemble the distribution package ---
-
-  cd "${pkgname}-${version}"
-
-  # Save the two carry-over groups, then replace the whole dist with our own.
-  mkdir -p ../carry
-  cp -r dist/src/core/graph ../carry/graph
-  cp dist/src/native/*.wasm ../carry/
-  rm -rf dist
-  cp -r ../_jsbuild/packages/nx/dist dist
-  rm -f dist/tsconfig.tsbuildinfo
-
-  # tsc doesn't set exec bits; upstream ships the bin entry points executable
-  # (its build runs scripts/chmod.js for this).
-  chmod 755 dist/bin/nx.js dist/bin/nx-cloud.js
-
-  # Asset copies, mirroring packages/nx/assets.json (all committed in the repo).
-  js_source_dir=../_jsbuild/packages/nx
-  package_dir=$PWD
-  mkdir -p dist/presets
-  cp "$js_source_dir"/presets/*.json dist/presets/
-  cd "$js_source_dir"
-  # shellcheck disable=SC2046
-  tar -cf - $(find src/migrations -name '*.md') | (cd "$package_dir/dist" && tar -xf -)
-  cd "$package_dir"
-  cp "$js_source_dir"/src/command-line/migrate/run-migration-process.js dist/src/command-line/migrate/
-  cp "$js_source_dir"/src/ai/set-up-ai-agents/schema.d.ts dist/src/ai/set-up-ai-agents/
-  cp "$js_source_dir"/src/utils/perf-hooks.d.ts dist/src/utils/
-  cp "$js_source_dir"/src/utils/yarn-syml/syml-grammar.js dist/src/utils/yarn-syml/
-  mkdir -p dist/src/command-line/completion
-  cp -r "$js_source_dir"/src/command-line/completion/scripts dist/src/command-line/completion/
-  cp "$js_source_dir"/src/native/browser.js "$js_source_dir"/src/native/index.js "$js_source_dir"/src/native/index.d.ts \
-    "$js_source_dir"/src/native/native-bindings.js "$js_source_dir"/src/native/nx.wasi-browser.js \
-    "$js_source_dir"/src/native/nx.wasi.cjs "$js_source_dir"/src/native/wasi-worker-browser.mjs \
-    "$js_source_dir"/src/native/wasi-worker.mjs dist/src/native/
-
-  # Restore the carry-overs and add the native binding (native-bindings.js'
-  # openharmony branch loads ./nx.openharmony-arm64.node next to itself first).
-  mkdir -p dist/src/core
-  cp -r ../carry/graph dist/src/core/graph
-  cp ../carry/*.wasm dist/src/native/
-  cp ../src/nx.openharmony-arm64.node dist/src/native/
-
-  cd ..
-
-  # --- verify package contents ---
-
-  node --check "${pkgname}-${version}/dist/src/native/assert-supported-platform.js"
-  grep -q openharmony "${pkgname}-${version}/dist/src/native/assert-supported-platform.js"
-
-  # CLI entry points must be executable in the tarball (upstream ships them so).
-  [ -x "${pkgname}-${version}/dist/bin/nx.js" ]
-  [ -x "${pkgname}-${version}/dist/bin/nx-cloud.js" ]
-
-  # Parity check: our dist must equal the published file set plus our one added
-  # .node — nothing missing, nothing extra.
-  cd "${pkgname}-${version}"
-  find dist -type f | sort >../our-dist.list
-  cd ..
-  grep -v '^dist/src/native/nx.openharmony-arm64.node$' our-dist.list >our-dist-minus-node.list
-  if ! diff -u published-dist.list our-dist-minus-node.list; then
-    echo "dist parity check FAILED: compiled dist does not match published file set" >&2
-    exit 1
-  fi
-
+function listFiles(root, dir = root) {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const file = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...listFiles(root, file));
+    else if (entry.isFile()) files.push(relative(root, file).split(sep).join('/'));
+  }
+  return files.sort();
 }
 
-check() {
-  # The .node must survive npm packing (package.json "files" whitelist).
-  package_tgz=$(npm pack --ignore-scripts "./${pkgname}-${version}" | tail -1)
-  tar -tzf "$package_tgz" | grep -q 'dist/src/native/nx.openharmony-arm64.node'
-
-  # The loader must resolve the bundled binding with a real dlopen: this
-  # container IS the target platform.
-  node -e '
-  const b = require("./'"${pkgname}-${version}"'/dist/src/native/native-bindings.js");
-  if (b.IS_WASM !== false) throw new Error("expected native binding, got WASI fallback");
-  const n = Object.keys(b).length;
-  console.log(`native binding loaded, IS_WASM=false, ${n} exports`);
-  if (n < 50) throw new Error(`suspiciously few exports: ${n}`);
-'
-
-  # --- functional smoke test: real `nx run` in a scratch workspace ---
-
-  smoke_dir=$PWD/smoke
-  mkdir -p "$smoke_dir/packages/pkg-a"
-  cd "$smoke_dir"
-
-  # Install under the literal name "nx", mirroring how consumers use the fork
-  # ("overrides": {"nx": "npm:@ohos-npm-ports/nx@..."}). Load-bearing: upstream
-  # code self-requires 'nx/package.json', so it only works at node_modules/nx.
-  cat >package.json <<EOF
-{
-  "name": "nx-ohos-smoke",
-  "private": true,
-  "workspaces": [
-    "packages/*"
-  ],
-  "dependencies": {
-    "nx": "file:../$package_tgz"
+function copyMatching(source, destination, extension) {
+  mkdirSync(destination, { recursive: true });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(extension)) {
+      cpSync(join(source, entry.name), join(destination, entry.name));
+    }
   }
 }
-EOF
-  cat >nx.json <<'EOF'
-{}
-EOF
-  cat >packages/pkg-a/package.json <<'EOF'
-{
-  "name": "pkg-a",
-  "version": "1.0.0",
-  "scripts": {
-    "build": "echo PKG_A_BUILT"
+
+function copyMigrationDocs(jsSourceDir) {
+  const source = join(jsSourceDir, 'src/migrations');
+  for (const file of listFiles(source)) {
+    if (!file.endsWith('.md')) continue;
+    const destination = join(packageDir, 'dist/src/migrations', file);
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(join(source, file), destination);
   }
 }
-EOF
 
-  npm install --ignore-scripts
+export default class Nx extends Port {
+  static pkgname = 'nx';
+  static upstream = 'nx';
+  static version = version;
+  static revision = 1;
+  static distTag = 'latest';
+  static packages = [`nx-${version}`];
+  static source = `https://registry.npmjs.org/nx/-/nx-${version}.tgz`;
+  static sha256 = '7b28f6421f8547ebf1437655e903e25ac781e961e7068e40c3d0f6dcb76a0e1f';
+  static resources = [
+    resource(
+      'vt100',
+      `https://codeload.github.com/JamesHenry/vt100-rust/tar.gz/${vt100Rev}`,
+      '644bb51e1072711e8e44da70dbfa69e0bcfd1579a289ea3b9758e4ca26113fc1',
+    ),
+    resource(
+      'wezterm',
+      `https://codeload.github.com/cammisuli/wezterm/tar.gz/${weztermRev}`,
+      'd722cb3cd4eea2d5309c6a39a09768cc57099f42aef21f5e527e28eafbd9b542',
+    ),
+  ];
 
-  # Own repo boundary: nx's ignore walker consults the nearest enclosing git
-  # repo, whose rules can hide the workspace from the project graph.
-  git init -q .
+  build() {
+    // Build the native binding with cargo and the CLI JavaScript with plain tsc.
+    // Upstream's full monorepo build requires toolchains unavailable on OpenHarmony.
+    run('git', [
+      'clone', '--depth', '1', '--filter=blob:none', '--sparse', '--branch', version,
+      'https://github.com/nrwl/nx', sourceDir,
+    ], { cwd: rootDir });
+    run('git', ['sparse-checkout', 'set', 'packages/nx'], { cwd: sourceDir });
 
-  # OHOS devices have a read-only /tmp and a short sun_path limit; the daemon
-  # socket dir must be a writable short path. Harmless elsewhere.
-  export NX_SOCKET_DIR="$smoke_dir/.nx-sock"
-  mkdir -p "$NX_SOCKET_DIR"
+    const gitdepsDir = join(rootDir, 'gitdeps');
+    mkdirSync(join(gitdepsDir, 'wezterm'), { recursive: true });
 
-  run_out=$(./node_modules/.bin/nx run pkg-a:build 2>&1)
-  echo "$run_out"
-  echo "$run_out" | grep -q PKG_A_BUILT
+    fetchResource('vt100', join(rootDir, 'vt100.tar.gz'));
+    run('tar', ['-zxf', 'vt100.tar.gz'], { cwd: rootDir });
+    renameSync(join(rootDir, `vt100-rust-${vt100Rev}`), join(gitdepsDir, 'vt100-rust'));
+    rmSync(join(rootDir, 'vt100.tar.gz'));
 
-  show_out=$(./node_modules/.bin/nx show projects 2>&1)
-  echo "$show_out"
-  echo "$show_out" | grep -q pkg-a
+    fetchResource('wezterm', join(rootDir, 'wezterm.tar.gz'));
+    run('tar', [
+      '-zxf', 'wezterm.tar.gz', `wezterm-${weztermRev}/pty`, `wezterm-${weztermRev}/filedescriptor`,
+    ], { cwd: rootDir });
+    renameSync(join(rootDir, `wezterm-${weztermRev}/pty`), join(gitdepsDir, 'wezterm/pty'));
+    renameSync(join(rootDir, `wezterm-${weztermRev}/filedescriptor`), join(gitdepsDir, 'wezterm/filedescriptor'));
+    rmSync(join(rootDir, `wezterm-${weztermRev}`), { recursive: true, force: true });
+    rmSync(join(rootDir, 'wezterm.tar.gz'));
 
-  # Exercise the carried-over graph assets path too (JSON export mode).
-  ./node_modules/.bin/nx graph --file="$smoke_dir/graph.json"
-  test -s "$smoke_dir/graph.json"
+    run('patch', ['-p1'], {
+      cwd: join(gitdepsDir, 'wezterm'),
+      input: readFileSync(join(rootDir, 'patches/0002-portable-pty-nix-bump.patch')),
+    });
+    for (const patch of [
+      '0001-nx-source-ohos.patch',
+      '0003-assert-supported-platform.patch',
+      '0004-tsc-expect-error-compat.patch',
+    ]) {
+      run('patch', ['-p1'], { cwd: sourceDir, input: readFileSync(join(rootDir, 'patches', patch)) });
+    }
 
-  ./node_modules/.bin/nx reset
+    run('cargo', ['build', '--release'], { cwd: sourceDir });
+    const nativeBuild = join(sourceDir, 'target/release/libnx.so');
+    assert.ok(statSync(nativeBuild).isFile());
+    const nativeOutput = join(sourceDir, 'nx.openharmony-arm64.node');
+    cpSync(nativeBuild, nativeOutput);
+    run('llvm-strip', ['--strip-all', nativeOutput]);
+    chmodSync(nativeOutput, 0o755);
 
-  echo "nx ${version} OpenHarmony port: build + smoke test OK"
+    fetchSource(join(rootDir, 'nx.tgz'));
+    run('tar', ['-zxf', 'nx.tgz'], { cwd: rootDir });
+    renameSync(join(rootDir, 'package'), packageDir);
+    const publishedDist = listFiles(join(packageDir, 'dist')).map((file) => `dist/${file}`);
+
+    mkdirSync(jsbuildDir, { recursive: true });
+    writeJson(join(jsbuildDir, 'package.json'), { name: 'nx-jsbuild', private: true });
+    cpSync(join(sourceDir, 'tsconfig.base.json'), join(jsbuildDir, 'tsconfig.base.json'));
+    mkdirSync(join(jsbuildDir, 'packages'), { recursive: true });
+    cpSync(join(sourceDir, 'packages/nx'), join(jsbuildDir, 'packages/nx'), { recursive: true });
+    rmSync(join(jsbuildDir, 'packages/nx/dist'), { recursive: true, force: true });
+
+    run('npm', ['install', '--ignore-scripts', ...npmInstallPackages], { cwd: jsbuildDir });
+    run(process.execPath, [
+      join(jsbuildDir, 'node_modules/typescript/bin/tsc'), '-p', 'packages/nx/tsconfig.lib.json',
+    ], { cwd: jsbuildDir });
+
+    mkdirSync(carryDir, { recursive: true });
+    cpSync(join(packageDir, 'dist/src/core/graph'), join(carryDir, 'graph'), { recursive: true });
+    copyMatching(join(packageDir, 'dist/src/native'), carryDir, '.wasm');
+    rmSync(join(packageDir, 'dist'), { recursive: true, force: true });
+    cpSync(join(jsbuildDir, 'packages/nx/dist'), join(packageDir, 'dist'), { recursive: true });
+    rmSync(join(packageDir, 'dist/tsconfig.tsbuildinfo'), { force: true });
+    chmodSync(join(packageDir, 'dist/bin/nx.js'), 0o755);
+    chmodSync(join(packageDir, 'dist/bin/nx-cloud.js'), 0o755);
+
+    const jsSourceDir = join(jsbuildDir, 'packages/nx');
+    copyMatching(join(jsSourceDir, 'presets'), join(packageDir, 'dist/presets'), '.json');
+    copyMigrationDocs(jsSourceDir);
+    for (const file of [
+      'src/command-line/migrate/run-migration-process.js',
+      'src/ai/set-up-ai-agents/schema.d.ts',
+      'src/utils/perf-hooks.d.ts',
+      'src/utils/yarn-syml/syml-grammar.js',
+    ]) {
+      cpSync(join(jsSourceDir, file), join(packageDir, 'dist', file));
+    }
+    mkdirSync(join(packageDir, 'dist/src/command-line/completion'), { recursive: true });
+    cpSync(
+      join(jsSourceDir, 'src/command-line/completion/scripts'),
+      join(packageDir, 'dist/src/command-line/completion/scripts'),
+      { recursive: true },
+    );
+    for (const file of [
+      'browser.js',
+      'index.js',
+      'index.d.ts',
+      'native-bindings.js',
+      'nx.wasi-browser.js',
+      'nx.wasi.cjs',
+      'wasi-worker-browser.mjs',
+      'wasi-worker.mjs',
+    ]) {
+      cpSync(join(jsSourceDir, 'src/native', file), join(packageDir, 'dist/src/native', file));
+    }
+
+    mkdirSync(join(packageDir, 'dist/src/core'), { recursive: true });
+    cpSync(join(carryDir, 'graph'), join(packageDir, 'dist/src/core/graph'), { recursive: true });
+    copyMatching(carryDir, join(packageDir, 'dist/src/native'), '.wasm');
+    cpSync(nativeOutput, join(packageDir, 'dist/src/native/nx.openharmony-arm64.node'));
+
+    const platformAssert = join(packageDir, 'dist/src/native/assert-supported-platform.js');
+    run(process.execPath, ['--check', platformAssert]);
+    assert.ok(readFileSync(platformAssert, 'utf8').includes('openharmony'));
+    accessSync(join(packageDir, 'dist/bin/nx.js'), constants.X_OK);
+    accessSync(join(packageDir, 'dist/bin/nx-cloud.js'), constants.X_OK);
+
+    const ourDist = listFiles(join(packageDir, 'dist'))
+      .map((file) => `dist/${file}`)
+      .filter((file) => file !== 'dist/src/native/nx.openharmony-arm64.node');
+    assert.deepEqual(ourDist, publishedDist, 'dist parity check FAILED: compiled dist does not match published file set');
+  }
+
+  package() {
+    const packed = run('npm', ['pack', '--ignore-scripts', '--silent', packageDir], {
+      cwd: rootDir,
+      capture: true,
+    }).stdout.trim().split('\n').at(-1);
+    const contents = run('tar', ['-tzf', packed], { cwd: rootDir, capture: true }).stdout;
+    assert.ok(contents.includes('dist/src/native/nx.openharmony-arm64.node'), 'native binding missing from npm tarball');
+
+    const outputRequire = createRequire(join(packageDir, 'package.json'));
+    const binding = outputRequire('./dist/src/native/native-bindings.js');
+    assert.equal(binding.IS_WASM, false, 'expected native binding, got WASI fallback');
+    const exports = Object.keys(binding).length;
+    console.log(`native binding loaded, IS_WASM=false, ${exports} exports`);
+    assert.ok(exports >= 50, `suspiciously few exports: ${exports}`);
+  }
+
+  async test() {
+    const [{ mkdtempSync }, { tmpdir }] = await Promise.all([import('node:fs'), import('node:os')]);
+    const { projectDir } = recipeContext();
+    const pkg = requirePackage('nx/package.json');
+    const packageRoot = dirname(recipeContext().resolvePackage('nx/package.json'));
+    const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin.nx;
+    const nx = join(packageRoot, bin);
+    const smokeDir = join(projectDir, 'smoke');
+    const socketDir = mkdtempSync(join(tmpdir(), 'nx-'));
+    mkdirSync(join(smokeDir, 'packages/pkg-a'), { recursive: true });
+    writeJson(join(smokeDir, 'package.json'), {
+      name: 'nx-ohos-smoke',
+      private: true,
+      workspaces: ['packages/*'],
+    });
+    writeJson(join(smokeDir, 'nx.json'), {});
+    writeJson(join(smokeDir, 'packages/pkg-a/package.json'), {
+      name: 'pkg-a',
+      version: '1.0.0',
+      scripts: { build: 'echo PKG_A_BUILT' },
+    });
+    run('git', ['init', '-q', '.'], { cwd: smokeDir });
+    mkdirSync(socketDir, { recursive: true });
+    const options = { cwd: smokeDir, capture: true, env: { NX_SOCKET_DIR: socketDir } };
+
+    const runResult = run(process.execPath, [nx, 'run', 'pkg-a:build'], options);
+    const runOutput = `${runResult.stdout}${runResult.stderr}`;
+    process.stdout.write(runOutput);
+    assert.ok(runOutput.includes('PKG_A_BUILT'));
+
+    const showResult = run(process.execPath, [nx, 'show', 'projects'], options);
+    const showOutput = `${showResult.stdout}${showResult.stderr}`;
+    process.stdout.write(showOutput);
+    assert.ok(showOutput.includes('pkg-a'));
+
+    const graphFile = join(smokeDir, 'graph.json');
+    run(process.execPath, [nx, 'graph', `--file=${graphFile}`], {
+      cwd: smokeDir,
+      env: { NX_SOCKET_DIR: socketDir },
+    });
+    assert.ok(statSync(graphFile).size > 0);
+    run(process.execPath, [nx, 'reset'], { cwd: smokeDir, env: { NX_SOCKET_DIR: socketDir } });
+
+    return {
+      result: { run: true, showProjects: true, graph: true, reset: true },
+      assets: [],
+    };
+  }
 }

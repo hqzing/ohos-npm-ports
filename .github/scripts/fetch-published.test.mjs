@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -12,11 +12,24 @@ const slot = '@ohos-npm-ports/demo-openharmony-arm64';
 const integrityOf = (content) => `sha512-${createHash('sha512').update(content).digest('base64')}`;
 
 // A port with a main package and one slot, the same shape build.mjs produces.
-function fixture(t, packages = '("@ohos-npm-ports/demo-openharmony-arm64:slot" "main")') {
+function fixture(t, packages = ['@ohos-npm-ports/demo-openharmony-arm64:slot', 'main']) {
   const root = mkdtempSync(join(tmpdir(), 'fetch-published-'));
   const dir = join(root, 'ports', 'd', 'demo');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'NPMBUILD'), `pkgname="demo"\nupstream="demo"\nversion="1.2.3"\nrevision=4\ndist_tag="latest"\npackages=${packages}\nbuild() { :; }\n`);
+  symlinkSync(join(process.cwd(), 'cli'), join(root, 'cli'), 'dir');
+  writeFileSync(join(dir, 'NPMBUILD'), `#!/usr/bin/env node
+import { Port } from '../../../cli/recipe.mjs';
+const version = '1.2.3';
+export default class Demo extends Port {
+  static pkgname = 'demo';
+  static upstream = 'demo';
+  static version = version;
+  static revision = 4;
+  static distTag = 'latest';
+  static packages = ${JSON.stringify(packages)};
+  build() {}
+}
+`);
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return root;
 }
@@ -85,7 +98,7 @@ test('a version that is not on npm cannot be fetched', (t) => {
 test('fetching fails instead of testing an incomplete set of packages', (t) => {
   const root = fixture(t);
   assert.throws(() => fetchPort(root, 'ports/d/demo', options(registry({ withSlot: false }))), /found 1 published package\(s\).*NPMBUILD builds 2/);
-  const single = fixture(t, '("main")');
+  const single = fixture(t, ['main']);
   assert.equal(fetchPort(single, 'ports/d/demo', options(registry({ withSlot: false }))).packages.length, 1);
 });
 
